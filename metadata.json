@@ -1,0 +1,6 @@
+{
+  "name": "Islamic Services Platform",
+  "description": "Foundation and Phase 1 architecture for the verified Islamic services platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

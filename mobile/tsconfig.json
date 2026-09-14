@@ -1,0 +1,9 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "typeRoots": ["./node_modules/@types"],
+    "types": ["jest"]
+  }
+}

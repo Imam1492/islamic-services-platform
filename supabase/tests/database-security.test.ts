@@ -681,23 +681,40 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
       }
     });
 
-    test('POS-04: Legitimate participant sends a message in active chat', async () => {
+    test('POS-04: Legitimate participant sends a message in active chat (customer and provider)', async () => {
       if (!isDbConnected) {
         expect(true).toBe(true);
         return;
       }
       const clientA = await createAuthClient(fixtures.userA);
+      const clientP = await createAuthClient(fixtures.provider1);
       try {
         const convRes = await clientA.query(`SELECT id FROM public.conversations WHERE request_id = $1;`, [activeReqId]);
         const convId = convRes.rows[0].id;
 
-        const msgRes = await clientA.query(
+        // 1. Customer User A inserts message
+        const msgResA = await clientA.query(
           `INSERT INTO public.messages (conversation_id, sender_id, content) VALUES ($1, $2, 'Peace be upon you') RETURNING id;`,
           [convId, fixtures.userA.id]
         );
-        expect(msgRes.rows[0].id).toBeDefined();
+        expect(msgResA.rows[0].id).toBeDefined();
+
+        // 2. Provider 1 inserts reply message
+        const msgResP = await clientP.query(
+          `INSERT INTO public.messages (conversation_id, sender_id, content) VALUES ($1, $2, 'Wa alaykumu as-salam') RETURNING id;`,
+          [convId, fixtures.provider1.id]
+        );
+        expect(msgResP.rows[0].id).toBeDefined();
+
+        // 3. Both participants can read conversation messages
+        const msgsForCustomer = await clientA.query(`SELECT id FROM public.messages WHERE conversation_id = $1;`, [convId]);
+        expect(msgsForCustomer.rows.length).toBeGreaterThanOrEqual(2);
+
+        const msgsForProvider = await clientP.query(`SELECT id FROM public.messages WHERE conversation_id = $1;`, [convId]);
+        expect(msgsForProvider.rows.length).toBeGreaterThanOrEqual(2);
       } finally {
         await clientA.end();
+        await clientP.end();
       }
     });
 
@@ -982,6 +999,270 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
       );
       expect(privRes.rows.length).toBe(1);
       expect(privRes.rows[0].phone_e164).toBeNull();
+    });
+  });
+
+  // ==========================================================================
+  // 6. PHASE 3.1: PROVIDER CATALOG DISCOVERY & PARTICIPANT HELPER TESTS
+  // ==========================================================================
+
+  describe('Phase 3.1: Provider Catalog Discovery & Participant Authorization Tests', () => {
+    const pendingProvUserId = '77777777-7777-4777-7777-777777777777';
+    let pendingProvProfileId: string;
+    let testReqId: string | null = null;
+    let testConvId: string | null = null;
+
+    beforeAll(async () => {
+      if (!isDbConnected || !adminClient) return;
+
+      await adminClient.query(`DELETE FROM public.provider_profiles WHERE user_id = $1;`, [pendingProvUserId]);
+      await adminClient.query(`DELETE FROM public.user_roles WHERE user_id = $1;`, [pendingProvUserId]);
+      await adminClient.query(`DELETE FROM public.user_private WHERE user_id = $1;`, [pendingProvUserId]);
+      await adminClient.query(`DELETE FROM public.users WHERE id = $1;`, [pendingProvUserId]);
+      await adminClient.query(`DELETE FROM auth.users WHERE id = $1;`, [pendingProvUserId]);
+
+      await adminClient.query(
+        `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
+         VALUES ($1, 'pendingprov@example.com', '+15557777777', '{"full_name": "Pending Provider"}'::jsonb);`,
+        [pendingProvUserId]
+      );
+      await adminClient.query(
+        `INSERT INTO public.user_roles (user_id, role) VALUES ($1, 'provider');`,
+        [pendingProvUserId]
+      );
+      const res = await adminClient.query(
+        `INSERT INTO public.provider_profiles (user_id, bio, gender, years_experience, status)
+         VALUES ($1, 'Unapproved bio', 'female', 2, 'pending') RETURNING id;`,
+        [pendingProvUserId]
+      );
+      pendingProvProfileId = res.rows[0].id;
+
+      // Create a test request and conversation to test participant validation
+      const reqRes = await adminClient.query(
+        `INSERT INTO public.service_requests (user_id, provider_id, service_id, location_id, status)
+         VALUES ($1, $2, $3, $4, 'CHAT_ACTIVE') RETURNING id;`,
+        [fixtures.userA.id, fixtures.provider1ProfileId, fixtures.serviceId, fixtures.areaAId]
+      );
+      testReqId = reqRes.rows[0].id;
+
+      const convRes = await adminClient.query(
+        `INSERT INTO public.conversations (request_id, user_id, provider_id)
+         VALUES ($1, $2, $3) RETURNING id;`,
+        [testReqId, fixtures.userA.id, fixtures.provider1ProfileId]
+      );
+      testConvId = convRes.rows[0].id;
+    });
+
+    afterAll(async () => {
+      if (!isDbConnected || !adminClient) return;
+      if (testConvId) {
+        await adminClient.query(`DELETE FROM public.conversations WHERE id = $1;`, [testConvId]);
+      }
+      if (testReqId) {
+        await adminClient.query(`DELETE FROM public.service_requests WHERE id = $1;`, [testReqId]);
+      }
+      await adminClient.query(`DELETE FROM public.provider_profiles WHERE user_id = $1;`, [pendingProvUserId]);
+      await adminClient.query(`DELETE FROM public.user_roles WHERE user_id = $1;`, [pendingProvUserId]);
+      await adminClient.query(`DELETE FROM public.user_private WHERE user_id = $1;`, [pendingProvUserId]);
+      await adminClient.query(`DELETE FROM public.users WHERE id = $1;`, [pendingProvUserId]);
+      await adminClient.query(`DELETE FROM auth.users WHERE id = $1;`, [pendingProvUserId]);
+    });
+
+    test('PROV-POS-01: Approved provider profile is visible to authenticated User A for catalog discovery', async () => {
+      if (!isDbConnected) {
+        expect(true).toBe(true);
+        return;
+      }
+      const clientA = await createAuthClient(fixtures.userA);
+      try {
+        const res = await clientA.query(
+          `SELECT id, bio, status FROM public.provider_profiles WHERE id = $1;`,
+          [fixtures.provider1ProfileId]
+        );
+        expect(res.rows.length).toBe(1);
+        expect(res.rows[0].status).toBe('approved');
+      } finally {
+        await clientA.end();
+      }
+    });
+
+    test('PROV-NEG-01: Pending/unapproved provider profile is NOT visible to authenticated User A', async () => {
+      if (!isDbConnected) {
+        expect(true).toBe(true);
+        return;
+      }
+      const clientA = await createAuthClient(fixtures.userA);
+      try {
+        const res = await clientA.query(
+          `SELECT id, bio, status FROM public.provider_profiles WHERE id = $1;`,
+          [pendingProvProfileId]
+        );
+        expect(res.rows.length).toBe(0);
+      } finally {
+        await clientA.end();
+      }
+    });
+
+    test('PROV-POS-02: Pending provider can view their own profile via self-access RLS policy', async () => {
+      if (!isDbConnected) {
+        expect(true).toBe(true);
+        return;
+      }
+      const pendingProvUser: TestUser = {
+        id: pendingProvUserId,
+        name: 'Pending Provider',
+        phone: '+15557777777',
+        token: generateSupabaseJwt(pendingProvUserId, 'authenticated')
+      };
+      const clientPendingProv = await createAuthClient(pendingProvUser);
+      try {
+        const res = await clientPendingProv.query(
+          `SELECT id, status FROM public.provider_profiles WHERE user_id = $1;`,
+          [pendingProvUserId]
+        );
+        expect(res.rows.length).toBe(1);
+        expect(res.rows[0].status).toBe('pending');
+      } finally {
+        await clientPendingProv.end();
+      }
+    });
+
+    test('PROV-POS-03: Participant validation helper accurately verifies membership and rejects arbitrary parameter probing', async () => {
+      if (!isDbConnected || !testConvId) {
+        expect(true).toBe(true);
+        return;
+      }
+      const clientA = await createAuthClient(fixtures.userA);
+      const clientB = await createAuthClient(fixtures.userB);
+      const clientP = await createAuthClient(fixtures.provider1);
+      try {
+        const convId = testConvId;
+
+        // User A (requester) is a participant
+        const checkA = await clientA.query(
+          `SELECT public.is_conversation_participant($1) as is_part;`,
+          [convId]
+        );
+        expect(checkA.rows[0].is_part).toBe(true);
+
+        // Provider 1 (assigned provider) is a participant
+        const checkP = await clientP.query(
+          `SELECT public.is_conversation_participant($1) as is_part;`,
+          [convId]
+        );
+        expect(checkP.rows[0].is_part).toBe(true);
+
+        // User B (non-participant) is NOT a participant
+        const checkB = await clientB.query(
+          `SELECT public.is_conversation_participant($1) as is_part;`,
+          [convId]
+        );
+        expect(checkB.rows[0].is_part).toBe(false);
+
+        // Client cannot pass arbitrary second parameter (function has arity 1)
+        let twoArgFailed = false;
+        try {
+          await clientB.query(
+            `SELECT public.is_conversation_participant($1, $2) as is_part;`,
+            [convId, fixtures.userA.id]
+          );
+        } catch (err: any) {
+          twoArgFailed = true;
+        }
+        expect(twoArgFailed).toBe(true);
+      } finally {
+        await clientA.end();
+        await clientB.end();
+        await clientP.end();
+      }
+    });
+
+    test('PROV-ADM-01: Area Admin A can access unapproved provider in Area A, but NOT in Area B or without declared area', async () => {
+      if (!isDbConnected || !adminClient) {
+        expect(true).toBe(true);
+        return;
+      }
+
+      // Create provider in Area A (pending)
+      const pAUser = '88888888-8888-4888-8888-888888888888';
+      await adminClient.query(`DELETE FROM public.provider_profiles WHERE user_id = $1;`, [pAUser]);
+      await adminClient.query(`DELETE FROM public.user_roles WHERE user_id = $1;`, [pAUser]);
+      await adminClient.query(`DELETE FROM public.user_private WHERE user_id = $1;`, [pAUser]);
+      await adminClient.query(`DELETE FROM public.users WHERE id = $1;`, [pAUser]);
+      await adminClient.query(`DELETE FROM auth.users WHERE id = $1;`, [pAUser]);
+      await adminClient.query(
+        `INSERT INTO auth.users (id, email, phone, raw_user_meta_data) VALUES ($1, 'prov_a@example.com', '+15558888888', '{"full_name": "Prov A"}'::jsonb);`,
+        [pAUser]
+      );
+      await adminClient.query(`INSERT INTO public.user_roles (user_id, role) VALUES ($1, 'provider');`, [pAUser]);
+      const pARes = await adminClient.query(
+        `INSERT INTO public.provider_profiles (user_id, bio, gender, years_experience, status) VALUES ($1, 'Bio A', 'male', 3, 'pending') RETURNING id;`,
+        [pAUser]
+      );
+      const pAProfileId = pARes.rows[0].id;
+      await adminClient.query(`INSERT INTO public.provider_locations (provider_id, location_id) VALUES ($1, $2);`, [pAProfileId, fixtures.areaAId]);
+
+      // Create provider in Area B (pending)
+      const pBUser = '99999999-9999-4999-9999-999999999999';
+      await adminClient.query(`DELETE FROM public.provider_profiles WHERE user_id = $1;`, [pBUser]);
+      await adminClient.query(`DELETE FROM public.user_roles WHERE user_id = $1;`, [pBUser]);
+      await adminClient.query(`DELETE FROM public.user_private WHERE user_id = $1;`, [pBUser]);
+      await adminClient.query(`DELETE FROM public.users WHERE id = $1;`, [pBUser]);
+      await adminClient.query(`DELETE FROM auth.users WHERE id = $1;`, [pBUser]);
+      await adminClient.query(
+        `INSERT INTO auth.users (id, email, phone, raw_user_meta_data) VALUES ($1, 'prov_b@example.com', '+15559999999', '{"full_name": "Prov B"}'::jsonb);`,
+        [pBUser]
+      );
+      await adminClient.query(`INSERT INTO public.user_roles (user_id, role) VALUES ($1, 'provider');`, [pBUser]);
+      const pBRes = await adminClient.query(
+        `INSERT INTO public.provider_profiles (user_id, bio, gender, years_experience, status) VALUES ($1, 'Bio B', 'female', 4, 'pending') RETURNING id;`,
+        [pBUser]
+      );
+      const pBProfileId = pBRes.rows[0].id;
+      await adminClient.query(`INSERT INTO public.provider_locations (provider_id, location_id) VALUES ($1, $2);`, [pBProfileId, fixtures.areaBId]);
+
+      const clientAreaAdmin = await createAuthClient(fixtures.areaAdmin);
+      const clientSuperAdmin = await createAuthClient(fixtures.superAdmin);
+      const clientOrdinary = await createAuthClient(fixtures.userA);
+
+      try {
+        // 1. Area Admin A can SELECT unapproved provider in Area A
+        const canSeeA = await clientAreaAdmin.query(`SELECT id FROM public.provider_profiles WHERE id = $1;`, [pAProfileId]);
+        expect(canSeeA.rows.length).toBe(1);
+
+        // 2. Area Admin A CANNOT SELECT unapproved provider in Area B
+        const canSeeB = await clientAreaAdmin.query(`SELECT id FROM public.provider_profiles WHERE id = $1;`, [pBProfileId]);
+        expect(canSeeB.rows.length).toBe(0);
+
+        // 3. Area Admin A CANNOT SELECT unapproved provider with no declared location
+        const canSeeNoLoc = await clientAreaAdmin.query(`SELECT id FROM public.provider_profiles WHERE id = $1;`, [pendingProvProfileId]);
+        expect(canSeeNoLoc.rows.length).toBe(0);
+
+        // 4. Super Admin can SELECT all unapproved provider profiles
+        const superCanSeeA = await clientSuperAdmin.query(`SELECT id FROM public.provider_profiles WHERE id = $1;`, [pAProfileId]);
+        const superCanSeeB = await clientSuperAdmin.query(`SELECT id FROM public.provider_profiles WHERE id = $1;`, [pBProfileId]);
+        const superCanSeeNoLoc = await clientSuperAdmin.query(`SELECT id FROM public.provider_profiles WHERE id = $1;`, [pendingProvProfileId]);
+        expect(superCanSeeA.rows.length).toBe(1);
+        expect(superCanSeeB.rows.length).toBe(1);
+        expect(superCanSeeNoLoc.rows.length).toBe(1);
+
+        // 5. Ordinary authenticated user CANNOT SELECT any unapproved provider
+        const ordCanSeeA = await clientOrdinary.query(`SELECT id FROM public.provider_profiles WHERE id = $1;`, [pAProfileId]);
+        const ordCanSeeB = await clientOrdinary.query(`SELECT id FROM public.provider_profiles WHERE id = $1;`, [pBProfileId]);
+        expect(ordCanSeeA.rows.length).toBe(0);
+        expect(ordCanSeeB.rows.length).toBe(0);
+      } finally {
+        await clientAreaAdmin.end();
+        await clientSuperAdmin.end();
+        await clientOrdinary.end();
+
+        await adminClient.query(`DELETE FROM public.provider_locations WHERE provider_id IN ($1, $2);`, [pAProfileId, pBProfileId]);
+        await adminClient.query(`DELETE FROM public.provider_profiles WHERE user_id IN ($1, $2);`, [pAUser, pBUser]);
+        await adminClient.query(`DELETE FROM public.user_roles WHERE user_id IN ($1, $2);`, [pAUser, pBUser]);
+        await adminClient.query(`DELETE FROM public.user_private WHERE user_id IN ($1, $2);`, [pAUser, pBUser]);
+        await adminClient.query(`DELETE FROM public.users WHERE id IN ($1, $2);`, [pAUser, pBUser]);
+        await adminClient.query(`DELETE FROM auth.users WHERE id IN ($1, $2);`, [pAUser, pBUser]);
+      }
     });
   });
 });

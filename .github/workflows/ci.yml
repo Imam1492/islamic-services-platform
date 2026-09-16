@@ -8,6 +8,13 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   mobile-check:
     name: Mobile Checks (Expo / React Native)
@@ -19,10 +26,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js LTS
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 'lts/*'
+          node-version: 22
           cache: 'npm'
           cache-dependency-path: mobile/package-lock.json
 
@@ -48,10 +55,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js LTS
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 'lts/*'
+          node-version: 22
           cache: 'npm'
           cache-dependency-path: admin/package-lock.json
 
@@ -66,3 +73,36 @@ jobs:
 
       - name: Run Jest tests
         run: npm test
+
+  database-security:
+    name: Database Security & Authorization Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Setup Supabase CLI (supabase-action)
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Start Supabase local services
+        run: |
+          supabase start
+          supabase db reset
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Database Security Integration Suite
+        run: npm run test:db
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+          SUPABASE_JWT_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+

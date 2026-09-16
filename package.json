@@ -8,16 +8,20 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test:db": "jest --config jest.config.cjs supabase/tests/database-security.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
+    "@supabase/supabase-js": "^2.116.0",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.3",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
+    "pg": "^8.23.0",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "vite": "^6.2.3"
@@ -25,14 +29,19 @@
   "devDependencies": {
     "@testing-library/react-native": "^14.0.1",
     "@types/express": "^4.17.21",
+    "@types/jest": "^30.0.0",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.14.0",
+    "@types/pg": "^8.23.1",
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.25.0",
     "eslint": "^9.39.5",
     "eslint-config-expo": "^57.0.2",
+    "jest": "^30.5.1",
     "prettier": "^3.9.6",
     "react-test-renderer": "^19.3.0",
     "tailwindcss": "^4.1.14",
+    "ts-jest": "^29.4.12",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.3"

@@ -1,0 +1,2 @@
+-- Seed data for local Supabase environment
+-- Phase 1 baseline: No application tables or schema defined yet.

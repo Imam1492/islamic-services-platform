@@ -1,10 +1,10 @@
-import '@testing-library/jest-dom';
-import { render } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import Page from '../page';
 
 describe('Admin Page', () => {
-  it('renders root page component without throwing', () => {
+  it('renders root page component with heading and Next.js logo', () => {
     render(<Page />);
-    expect(document.body).toBeDefined();
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent(/to get started, edit the page\.tsx file/i);
+    expect(screen.getByAltText(/next\.js logo/i)).toBeInTheDocument();
   });
 });

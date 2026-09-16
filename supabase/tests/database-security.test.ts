@@ -120,7 +120,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
 
     // Clean any prior fixture data
     await adminClient.query(`DELETE FROM public.audit_logs WHERE actor_id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
-    await adminClient.query(`DELETE FROM public.contact_shares WHERE sharer_id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
+    await adminClient.query(`DELETE FROM public.contact_shares WHERE sharer_id IN ($1, $2, $3, $4, $5) OR recipient_id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
     await adminClient.query(`DELETE FROM public.conversations WHERE user_id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
     await adminClient.query(`DELETE FROM public.service_requests WHERE user_id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
     await adminClient.query(`DELETE FROM public.provider_locations WHERE provider_id IN (SELECT id FROM public.provider_profiles WHERE user_id = $1);`, [p1Id]);
@@ -129,20 +129,22 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     await adminClient.query(`DELETE FROM public.user_roles WHERE user_id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
     await adminClient.query(`DELETE FROM public.user_private WHERE user_id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
     await adminClient.query(`DELETE FROM public.users WHERE id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
+    await adminClient.query(`DELETE FROM auth.users WHERE id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
 
-    // Insert Users
+    // Insert Auth Users FIRST: existing production triggers (on_auth_user_created -> public.handle_new_auth_user())
+    // will provision public.users, public.user_roles (default 'user'), and public.user_private (phone_e164).
     for (const u of [fixtures.userA, fixtures.userB, fixtures.provider1, fixtures.areaAdmin, fixtures.superAdmin]) {
+      const email = `${u.name.toLowerCase().replace(/\s+/g, '')}@example.com`;
       await adminClient.query(
-        `INSERT INTO public.users (id, full_name, is_active) VALUES ($1, $2, true) ON CONFLICT (id) DO UPDATE SET full_name = $2;`,
-        [u.id, u.name]
-      );
-      await adminClient.query(
-        `INSERT INTO public.user_private (user_id, phone_e164) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET phone_e164 = $2;`,
-        [u.id, u.phone]
+        `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
+         VALUES ($1, $2, $3, $4::jsonb)
+         ON CONFLICT (id) DO UPDATE
+         SET email = $2, phone = $3, raw_user_meta_data = $4::jsonb;`,
+        [u.id, email, u.phone, JSON.stringify({ full_name: u.name })]
       );
     }
 
-    // Assign Roles
+    // Assign Specialized Roles (provider, area_admin, super_admin)
     await adminClient.query(`INSERT INTO public.user_roles (user_id, role) VALUES ($1, 'provider') ON CONFLICT DO NOTHING;`, [p1Id]);
     await adminClient.query(`INSERT INTO public.user_roles (user_id, role) VALUES ($1, 'area_admin') ON CONFLICT DO NOTHING;`, [aAdminId]);
     await adminClient.query(`INSERT INTO public.user_roles (user_id, role) VALUES ($1, 'super_admin') ON CONFLICT DO NOTHING;`, [sAdminId]);

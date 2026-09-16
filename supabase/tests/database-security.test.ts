@@ -834,12 +834,18 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
       }
       const clientA = await createAuthClient(fixtures.userA);
       try {
-        await expect(
-          clientA.query(
-            `UPDATE public.user_private SET phone_e164 = '+19998887777' WHERE user_id = $1;`,
-            [fixtures.userB.id]
-          )
-        ).rejects.toThrow();
+        const res = await clientA.query(
+          `UPDATE public.user_private SET phone_e164 = '+19998887777' WHERE user_id = $1;`,
+          [fixtures.userB.id]
+        );
+        expect(res.rowCount).toBe(0);
+
+        const verifyRes = await adminClient.query(
+          `SELECT phone_e164 FROM public.user_private WHERE user_id = $1;`,
+          [fixtures.userB.id]
+        );
+        expect(verifyRes.rows.length).toBe(1);
+        expect(verifyRes.rows[0].phone_e164).toBe(fixtures.userB.phone);
       } finally {
         await clientA.end();
       }

@@ -11,7 +11,8 @@
  */
 
 import { Client } from 'pg';
-import jwt from 'jsonwebtoken';
+import * as jwtLib from 'jsonwebtoken';
+const jwt: typeof import('jsonwebtoken') = (jwtLib as any).default ?? jwtLib;
 
 // Types & Config
 interface TestUser {
@@ -212,6 +213,23 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     if (adminClient && isDbConnected) {
       await adminClient.end();
     }
+  });
+
+  // ==========================================================================
+  // 0. TEST HARNESS & JWT VERIFICATION
+  // ==========================================================================
+
+  describe('Test Harness & JWT Signing Verification', () => {
+    test('HARNESS-01: generateSupabaseJwt produces cryptographically valid HS256 Supabase JWT via jsonwebtoken', () => {
+      const testId = '11111111-1111-4111-8111-111111111111';
+      const token = generateSupabaseJwt(testId, 'authenticated');
+      expect(typeof token).toBe('string');
+      expect(token.split('.').length).toBe(3);
+      const decoded = jwt.verify(token, JWT_SECRET) as any;
+      expect(decoded.sub).toBe(testId);
+      expect(decoded.role).toBe('authenticated');
+      expect(decoded.aud).toBe('authenticated');
+    });
   });
 
   // ==========================================================================

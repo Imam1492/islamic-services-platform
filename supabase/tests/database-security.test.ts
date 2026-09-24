@@ -1037,20 +1037,36 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
       );
       pendingProvProfileId = res.rows[0].id;
 
-      // Create a test request and conversation to test participant validation
+      // Create a test request and conversation using the canonical production lifecycle
       const reqRes = await adminClient.query(
         `INSERT INTO public.service_requests (user_id, provider_id, service_id, location_id, status)
-         VALUES ($1, $2, $3, $4, 'CHAT_ACTIVE') RETURNING id;`,
+         VALUES ($1, $2, $3, $4, 'REQUESTED') RETURNING id;`,
         [fixtures.userA.id, fixtures.provider1ProfileId, fixtures.serviceId, fixtures.areaAId]
       );
       testReqId = reqRes.rows[0].id;
 
-      const convRes = await adminClient.query(
-        `INSERT INTO public.conversations (request_id, user_id, provider_id)
-         VALUES ($1, $2, $3) RETURNING id;`,
-        [testReqId, fixtures.userA.id, fixtures.provider1ProfileId]
-      );
-      testConvId = convRes.rows[0].id;
+      // Authenticated provider accepts request
+      const clientP = await createAuthClient(fixtures.provider1);
+      try {
+        await clientP.query(
+          `SELECT public.transition_service_request($1, 'ACCEPTED', 'Accepting request') as out;`,
+          [testReqId]
+        );
+      } finally {
+        await clientP.end();
+      }
+
+      // Authenticated User A activates chat and provisions conversation
+      const clientA = await createAuthClient(fixtures.userA);
+      try {
+        const actRes = await clientA.query(
+          `SELECT public.activate_request_chat($1) as out;`,
+          [testReqId]
+        );
+        testConvId = actRes.rows[0].out.conversation_id;
+      } finally {
+        await clientA.end();
+      }
     });
 
     afterAll(async () => {

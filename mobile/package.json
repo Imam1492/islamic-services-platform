@@ -12,7 +12,9 @@
     "test": "jest --watchAll=false"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.117.1",
     "expo": "~57.0.22",
+    "expo-secure-store": "^57.0.4",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
     "react-native": "0.86.3"

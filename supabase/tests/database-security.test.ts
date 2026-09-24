@@ -1327,4 +1327,352 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
       }
     });
   });
+
+  // ==========================================================================
+  // 6. PHASE 3.2 STEP 2A: DATABASE ONBOARDING & CONSENT FOUNDATION TESTS
+  // ==========================================================================
+
+  describe('Phase 3.2 Step 2A: Database Onboarding & Consent Foundation Tests', () => {
+    const obUser1Id = '88888888-8888-4888-8888-888888888881';
+    const obUser2Id = '88888888-8888-4888-8888-888888888882';
+    const obUser3Id = '88888888-8888-4888-8888-888888888883';
+
+    const testUsers = [
+      { id: obUser1Id, name: 'User', phone: '+12025550201', token: generateSupabaseJwt(obUser1Id) },
+      { id: obUser2Id, name: 'User', phone: '+12025550202', token: generateSupabaseJwt(obUser2Id) },
+      { id: obUser3Id, name: 'User', phone: '+12025550203', token: generateSupabaseJwt(obUser3Id) },
+    ];
+
+    beforeAll(async () => {
+      if (!isDbConnected) return;
+
+      // Cleanup any pre-existing records
+      await adminClient.query(`DELETE FROM public.audit_logs WHERE actor_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
+      await adminClient.query(`DELETE FROM public.user_consents WHERE user_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
+      await adminClient.query(`DELETE FROM public.user_roles WHERE user_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
+      await adminClient.query(`DELETE FROM public.user_private WHERE user_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
+      await adminClient.query(`DELETE FROM public.users WHERE id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
+      await adminClient.query(`DELETE FROM auth.users WHERE id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
+
+      // Provision simulated fresh users who just completed phone OTP (name defaults to 'User', onboarded_at is NULL)
+      for (const u of testUsers) {
+        await adminClient.query(
+          `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
+           VALUES ($1, $2, $3, '{}'::jsonb);`,
+          [u.id, `${u.id}@example.com`, u.phone]
+        );
+      }
+    });
+
+    afterAll(async () => {
+      if (!isDbConnected) return;
+      await adminClient.query(`DELETE FROM public.audit_logs WHERE actor_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
+      await adminClient.query(`DELETE FROM public.user_consents WHERE user_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
+      await adminClient.query(`DELETE FROM public.user_roles WHERE user_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
+      await adminClient.query(`DELETE FROM public.user_private WHERE user_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
+      await adminClient.query(`DELETE FROM public.users WHERE id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
+      await adminClient.query(`DELETE FROM auth.users WHERE id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
+    });
+
+    test('ONBOARD-NEG-01: Anonymous / unauthenticated caller cannot execute complete_user_onboarding', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const anonClient = new Client({ connectionString: DB_URL });
+      await anonClient.connect();
+      try {
+        await anonClient.query(`SET ROLE anon;`);
+        await expect(
+          anonClient.query(`SELECT public.complete_user_onboarding('Ahmad Khan', '2026-09-v1.0', '2026-09-v1.0');`)
+        ).rejects.toThrow(/permission denied/i);
+      } finally {
+        await anonClient.end();
+      }
+    });
+
+    test('ONBOARD-NEG-02: RPC signature has no user_id parameter (derived strictly from auth.uid())', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const paramCheck = await adminClient.query(`
+        SELECT parameter_name, data_type
+        FROM information_schema.parameters
+        WHERE specific_schema = 'public'
+          AND specific_name LIKE 'complete_user_onboarding%'
+        ORDER BY ordinal_position;
+      `);
+      const paramNames = paramCheck.rows.map((r: any) => r.parameter_name);
+      expect(paramNames).toEqual(['p_full_name', 'p_tos_version', 'p_privacy_policy_version']);
+      expect(paramNames.includes('user_id')).toBe(false);
+      expect(paramNames.includes('p_user_id')).toBe(false);
+    });
+
+    test('ONBOARD-NEG-03: Invalid, empty, or whitespace full name is rejected', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const client = await createAuthClient(testUsers[0]);
+      try {
+        // Empty
+        await expect(
+          client.query(`SELECT public.complete_user_onboarding('', '2026-09-v1.0', '2026-09-v1.0');`)
+        ).rejects.toThrow(/between 2 and 100 characters/i);
+
+        // Whitespace only
+        await expect(
+          client.query(`SELECT public.complete_user_onboarding('   ', '2026-09-v1.0', '2026-09-v1.0');`)
+        ).rejects.toThrow(/between 2 and 100 characters/i);
+
+        // Too short (1 char)
+        await expect(
+          client.query(`SELECT public.complete_user_onboarding('A', '2026-09-v1.0', '2026-09-v1.0');`)
+        ).rejects.toThrow(/between 2 and 100 characters/i);
+
+        // Too long (>100 chars)
+        const longName = 'A'.repeat(101);
+        await expect(
+          client.query(`SELECT public.complete_user_onboarding($1, '2026-09-v1.0', '2026-09-v1.0');`, [longName])
+        ).rejects.toThrow(/between 2 and 100 characters/i);
+      } finally {
+        await client.end();
+      }
+    });
+
+    test('ONBOARD-NEG-04: Empty or whitespace document versions are rejected', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const client = await createAuthClient(testUsers[0]);
+      try {
+        // Empty tos
+        await expect(
+          client.query(`SELECT public.complete_user_onboarding('Ahmad Khan', '', '2026-09-v1.0');`)
+        ).rejects.toThrow(/Terms of Service version must be between 1 and 50 characters/i);
+
+        // Whitespace tos
+        await expect(
+          client.query(`SELECT public.complete_user_onboarding('Ahmad Khan', '   ', '2026-09-v1.0');`)
+        ).rejects.toThrow(/Terms of Service version must be between 1 and 50 characters/i);
+
+        // Empty privacy
+        await expect(
+          client.query(`SELECT public.complete_user_onboarding('Ahmad Khan', '2026-09-v1.0', '');`)
+        ).rejects.toThrow(/Privacy Policy version must be between 1 and 50 characters/i);
+
+        // Whitespace privacy
+        await expect(
+          client.query(`SELECT public.complete_user_onboarding('Ahmad Khan', '2026-09-v1.0', '   ');`)
+        ).rejects.toThrow(/Privacy Policy version must be between 1 and 50 characters/i);
+      } finally {
+        await client.end();
+      }
+    });
+
+    test('ONBOARD-NEG-05: Oversized document versions (>50 chars) are rejected', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const client = await createAuthClient(testUsers[0]);
+      try {
+        const longVersion = 'v'.repeat(51);
+        await expect(
+          client.query(`SELECT public.complete_user_onboarding('Ahmad Khan', $1, '2026-09-v1.0');`, [longVersion])
+        ).rejects.toThrow(/Terms of Service version must be between 1 and 50 characters/i);
+
+        await expect(
+          client.query(`SELECT public.complete_user_onboarding('Ahmad Khan', '2026-09-v1.0', $1);`, [longVersion])
+        ).rejects.toThrow(/Privacy Policy version must be between 1 and 50 characters/i);
+      } finally {
+        await client.end();
+      }
+    });
+
+    test('ONBOARD-NEG-06 to NEG-08: Direct authenticated INSERT, UPDATE, DELETE on user_consents is rejected', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const client = await createAuthClient(testUsers[0]);
+      try {
+        // Direct INSERT blocked
+        await expect(
+          client.query(
+            `INSERT INTO public.user_consents (user_id, tos_version, privacy_policy_version, adult_acknowledgement_given)
+             VALUES ($1, 'v1', 'v1', true);`,
+            [testUsers[0].id]
+          )
+        ).rejects.toThrow(/permission denied/i);
+
+        // Direct UPDATE blocked
+        await expect(
+          client.query(`UPDATE public.user_consents SET tos_version = 'v2' WHERE user_id = $1;`, [testUsers[0].id])
+        ).rejects.toThrow(/permission denied/i);
+
+        // Direct DELETE blocked
+        await expect(
+          client.query(`DELETE FROM public.user_consents WHERE user_id = $1;`, [testUsers[0].id])
+        ).rejects.toThrow(/permission denied/i);
+      } finally {
+        await client.end();
+      }
+    });
+
+    test('ONBOARD-NEG-09 & NEG-10: Client cannot directly mutate public.users.onboarded_at', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const client = await createAuthClient(testUsers[0]);
+      try {
+        await expect(
+          client.query(`UPDATE public.users SET onboarded_at = now() WHERE id = $1;`, [testUsers[0].id])
+        ).rejects.toThrow(/permission denied/i);
+
+        await expect(
+          client.query(`UPDATE public.users SET full_name = 'Hacked Name' WHERE id = $1;`, [testUsers[0].id])
+        ).rejects.toThrow(/permission denied/i);
+      } finally {
+        await client.end();
+      }
+    });
+
+    test('ONBOARD-POS-01 to POS-07: Authenticated user can complete onboarding; generates atomic consent and audit record', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const client = await createAuthClient(testUsers[0]);
+      try {
+        const startTime = new Date(Date.now() - 5000);
+        const res = await client.query(
+          `SELECT public.complete_user_onboarding('Ahmad Al-Mansoor', '2026-09-v1.0', '2026-09-v1.0') as payload;`
+        );
+        const payload = res.rows[0].payload;
+        expect(payload.status).toBe('success');
+        expect(payload.user_id).toBe(testUsers[0].id);
+        expect(payload.consent_id).toBeDefined();
+
+        const onboardedAt = new Date(payload.onboarded_at);
+        expect(onboardedAt.getTime()).toBeGreaterThanOrEqual(startTime.getTime());
+
+        // 1. Verify public.users row updated atomically
+        const userRow = await adminClient.query(`SELECT full_name, onboarded_at FROM public.users WHERE id = $1;`, [testUsers[0].id]);
+        expect(userRow.rows[0].full_name).toBe('Ahmad Al-Mansoor');
+        expect(new Date(userRow.rows[0].onboarded_at).toISOString()).toBe(onboardedAt.toISOString());
+
+        // 2. Verify exactly one consent record in public.user_consents
+        const consentRows = await adminClient.query(`SELECT * FROM public.user_consents WHERE user_id = $1;`, [testUsers[0].id]);
+        expect(consentRows.rows.length).toBe(1);
+        const consent = consentRows.rows[0];
+        expect(consent.id).toBe(payload.consent_id);
+        expect(consent.user_id).toBe(testUsers[0].id);
+        expect(consent.tos_version).toBe('2026-09-v1.0');
+        expect(consent.privacy_policy_version).toBe('2026-09-v1.0');
+        expect(consent.adult_acknowledgement_given).toBe(true);
+        expect(new Date(consent.accepted_at).getTime()).toBeGreaterThanOrEqual(startTime.getTime());
+
+        // 3. Verify user can read their own consent record via RLS policy
+        const clientConsent = await client.query(`SELECT * FROM public.user_consents WHERE user_id = $1;`, [testUsers[0].id]);
+        expect(clientConsent.rows.length).toBe(1);
+
+        // 4. Verify other users CANNOT read user 1 consent record via RLS
+        const client2 = await createAuthClient(testUsers[1]);
+        try {
+          const crossConsent = await client2.query(`SELECT * FROM public.user_consents WHERE user_id = $1;`, [testUsers[0].id]);
+          expect(crossConsent.rows.length).toBe(0);
+        } finally {
+          await client2.end();
+        }
+
+        // 5. Verify audit log entry created without unnecessary PII (no actual name)
+        const auditRows = await adminClient.query(
+          `SELECT * FROM public.audit_logs WHERE actor_id = $1 AND action = 'USER_ONBOARDING_COMPLETED';`,
+          [testUsers[0].id]
+        );
+        expect(auditRows.rows.length).toBe(1);
+        const audit = auditRows.rows[0];
+        expect(audit.entity_type).toBe('users');
+        expect(audit.entity_id).toBe(testUsers[0].id);
+        expect(audit.new_data.tos_version).toBe('2026-09-v1.0');
+        expect(audit.new_data.privacy_policy_version).toBe('2026-09-v1.0');
+        expect(audit.new_data.adult_acknowledgement_given).toBe(true);
+        expect(audit.new_data.consent_id).toBe(payload.consent_id);
+        expect(audit.new_data.name_char_length).toBe('Ahmad Al-Mansoor'.length);
+        // Guarantee no raw PII in audit data
+        expect(JSON.stringify(audit.new_data).includes('Ahmad Al-Mansoor')).toBe(false);
+      } finally {
+        await client.end();
+      }
+    });
+
+    test('ONBOARD-NEG-11 & NEG-12: Calling onboarding a second time explicitly fails and leaves consent unchanged', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const client = await createAuthClient(testUsers[0]);
+      try {
+        const consentBefore = await adminClient.query(`SELECT accepted_at FROM public.user_consents WHERE user_id = $1;`, [testUsers[0].id]);
+        const initialTimestamp = consentBefore.rows[0].accepted_at;
+
+        // Second call must fail
+        await expect(
+          client.query(`SELECT public.complete_user_onboarding('Ahmad Khan Second Try', '2026-09-v2.0', '2026-09-v2.0');`)
+        ).rejects.toThrow(/already completed onboarding/i);
+
+        // Name, onboarded_at, and consent row remain completely unchanged
+        const userRow = await adminClient.query(`SELECT full_name FROM public.users WHERE id = $1;`, [testUsers[0].id]);
+        expect(userRow.rows[0].full_name).toBe('Ahmad Al-Mansoor');
+
+        const consentAfter = await adminClient.query(`SELECT accepted_at FROM public.user_consents WHERE user_id = $1;`, [testUsers[0].id]);
+        expect(consentAfter.rows.length).toBe(1);
+        expect(new Date(consentAfter.rows[0].accepted_at).toISOString()).toBe(new Date(initialTimestamp).toISOString());
+      } finally {
+        await client.end();
+      }
+    });
+
+    test('ONBOARD-POS-08: Concurrency control via FOR UPDATE exclusively locks user row', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const clientA = await createAuthClient(testUsers[1]);
+      const clientB = await createAuthClient(testUsers[1]);
+
+      try {
+        // Run concurrent onboarding attempts for testUser[1]
+        const p1 = clientA.query(`SELECT public.complete_user_onboarding('Concurrent User', '2026-09-v1.0', '2026-09-v1.0');`);
+        const p2 = clientB.query(`SELECT public.complete_user_onboarding('Concurrent User 2', '2026-09-v1.0', '2026-09-v1.0');`);
+
+        const results = await Promise.allSettled([p1, p2]);
+        const fulfilled = results.filter((r) => r.status === 'fulfilled');
+        const rejected = results.filter((r) => r.status === 'rejected');
+
+        // Exactly one should succeed, and one must be rejected due to already completed onboarding lock
+        expect(fulfilled.length).toBe(1);
+        expect(rejected.length).toBe(1);
+
+        // Verify only 1 consent record was inserted
+        const consentCount = await adminClient.query(`SELECT COUNT(*)::int as count FROM public.user_consents WHERE user_id = $1;`, [testUsers[1].id]);
+        expect(consentCount.rows[0].count).toBe(1);
+      } finally {
+        await clientA.end();
+        await clientB.end();
+      }
+    });
+
+    test('ONBOARD-NEG-13: Failed onboarding transaction leaves no partial user, consent, or audit state', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const client = await createAuthClient(testUsers[2]);
+      try {
+        // Attempt with invalid version
+        await expect(
+          client.query(`SELECT public.complete_user_onboarding('Valid Name', '', '2026-09-v1.0');`)
+        ).rejects.toThrow();
+
+        // Verify users row was NOT modified
+        const userRow = await adminClient.query(`SELECT full_name, onboarded_at FROM public.users WHERE id = $1;`, [testUsers[2].id]);
+        expect(userRow.rows[0].full_name).toBe('User');
+        expect(userRow.rows[0].onboarded_at).toBeNull();
+
+        // Verify no consent row was inserted
+        const consentRow = await adminClient.query(`SELECT * FROM public.user_consents WHERE user_id = $1;`, [testUsers[2].id]);
+        expect(consentRow.rows.length).toBe(0);
+
+        // Verify no audit log entry was created
+        const auditRow = await adminClient.query(`SELECT * FROM public.audit_logs WHERE actor_id = $1 AND action = 'USER_ONBOARDING_COMPLETED';`, [testUsers[2].id]);
+        expect(auditRow.rows.length).toBe(0);
+      } finally {
+        await client.end();
+      }
+    });
+
+    test('ONBOARD-NEG-14: Consent immutability trigger blocks UPDATE and DELETE on user_consents', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      // Even direct adminClient (privileged role) is blocked by the immutability trigger
+      await expect(
+        adminClient.query(`UPDATE public.user_consents SET tos_version = 'tampered' WHERE user_id = $1;`, [testUsers[0].id])
+      ).rejects.toThrow(/append-only and immutable/i);
+
+      await expect(
+        adminClient.query(`DELETE FROM public.user_consents WHERE user_id = $1;`, [testUsers[0].id])
+      ).rejects.toThrow(/append-only and immutable/i);
+    });
+  });
 });

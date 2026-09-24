@@ -4,8 +4,9 @@
 -- 2. Refactors p_messages_insert_sender and p_messages_select_participant to decouple customer authorization
 --    from provider_profiles visibility while maintaining strict participant validation for providers.
 -- 3. Refactors p_conversations_select_participant to leverage participant helper.
--- 4. Establishes exact-area discovery RLS policy on public.provider_profiles (approved catalog, self-access,
---    super_admin global access, and exact-area-only unapproved profile access for area_admin).
+-- 4. Creates single-parameter SECURITY DEFINER admin provider visibility helper (can_admin_view_provider).
+-- 5. Establishes exact-area discovery RLS policy on public.provider_profiles (approved catalog, self-access,
+--    super_admin global access, and exact-area-only unapproved profile access for area_admin via helper).
 
 -- ============================================================================
 -- 1. SECURITY DEFINER PARTICIPANT VALIDATION HELPER (SINGLE PARAMETER)
@@ -99,7 +100,65 @@ CREATE POLICY p_conversations_select_participant
   );
 
 -- ============================================================================
--- 4. EXACT-AREA DISCOVERY SELECT POLICY FOR PROVIDER_PROFILES
+-- 4. SECURITY DEFINER ADMIN PROVIDER VISIBILITY HELPER
+-- ============================================================================
+
+DROP FUNCTION IF EXISTS public.can_admin_view_provider(uuid);
+
+CREATE OR REPLACE FUNCTION public.can_admin_view_provider(
+  p_provider_id uuid
+)
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+DECLARE
+  v_actor_id uuid := auth.uid();
+BEGIN
+  IF p_provider_id IS NULL OR v_actor_id IS NULL THEN
+    RETURN false;
+  END IF;
+
+  -- 1. Super admin has global visibility over all provider profiles
+  IF EXISTS (
+    SELECT 1
+    FROM public.user_roles ur
+    WHERE ur.user_id = v_actor_id
+      AND ur.role = 'super_admin'::public.app_role
+  ) THEN
+    RETURN true;
+  END IF;
+
+  -- 2. Area admin can view provider profiles ONLY if provider declared an exact location
+  --    that matches an admin_area_assignment for the caller
+  IF EXISTS (
+    SELECT 1
+    FROM public.user_roles ur
+    WHERE ur.user_id = v_actor_id
+      AND ur.role = 'area_admin'::public.app_role
+  ) THEN
+    RETURN EXISTS (
+      SELECT 1
+      FROM public.provider_locations pl
+      JOIN public.admin_area_assignments aaa ON aaa.location_id = pl.location_id
+      WHERE pl.provider_id = p_provider_id
+        AND aaa.user_id = v_actor_id
+    );
+  END IF;
+
+  RETURN false;
+END;
+$$;
+
+-- Secure helper function permissions
+REVOKE EXECUTE ON FUNCTION public.can_admin_view_provider(uuid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.can_admin_view_provider(uuid) FROM anon;
+GRANT EXECUTE ON FUNCTION public.can_admin_view_provider(uuid) TO authenticated, service_role, postgres;
+
+-- ============================================================================
+-- 5. EXACT-AREA DISCOVERY SELECT POLICY FOR PROVIDER_PROFILES
 -- ============================================================================
 
 DROP POLICY IF EXISTS p_provider_profiles_select ON public.provider_profiles;
@@ -112,24 +171,7 @@ CREATE POLICY p_provider_profiles_select
     status = 'approved'::public.provider_status
     -- 2. Provider can always view their own profile (any status)
     OR user_id = auth.uid()
-    -- 3. Super admin has global visibility over all profiles
-    OR EXISTS (
-      SELECT 1 FROM public.user_roles ur
-      WHERE ur.user_id = auth.uid()
-        AND ur.role = 'super_admin'::public.app_role
-    )
-    -- 4. Area admin can view unapproved profiles ONLY if provider declared exact assigned Area
-    OR (
-      EXISTS (
-        SELECT 1 FROM public.user_roles ur
-        WHERE ur.user_id = auth.uid()
-          AND ur.role = 'area_admin'::public.app_role
-      )
-      AND EXISTS (
-        SELECT 1 FROM public.provider_locations pl
-        JOIN public.admin_area_assignments aaa ON aaa.location_id = pl.location_id
-        WHERE pl.provider_id = provider_profiles.id
-          AND aaa.user_id = auth.uid()
-      )
-    )
+    -- 3. Super admin & Area admin access via SECURITY DEFINER helper
+    OR public.can_admin_view_provider(id)
   );
+

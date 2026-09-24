@@ -1267,6 +1267,52 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
         const ordCanSeeB = await clientOrdinary.query(`SELECT id FROM public.provider_profiles WHERE id = $1;`, [pBProfileId]);
         expect(ordCanSeeA.rows.length).toBe(0);
         expect(ordCanSeeB.rows.length).toBe(0);
+
+        // 6. Direct helper function checks: verify boolean return without data leakage
+        const ordHelperRes = await clientOrdinary.query(`SELECT public.can_admin_view_provider($1) AS allowed;`, [pAProfileId]);
+        expect(ordHelperRes.rows[0].allowed).toBe(false);
+
+        const areaAdminHelperA = await clientAreaAdmin.query(`SELECT public.can_admin_view_provider($1) AS allowed;`, [pAProfileId]);
+        expect(areaAdminHelperA.rows[0].allowed).toBe(true);
+
+        const areaAdminHelperB = await clientAreaAdmin.query(`SELECT public.can_admin_view_provider($1) AS allowed;`, [pBProfileId]);
+        expect(areaAdminHelperB.rows[0].allowed).toBe(false);
+
+        const areaAdminHelperNoLoc = await clientAreaAdmin.query(`SELECT public.can_admin_view_provider($1) AS allowed;`, [pendingProvProfileId]);
+        expect(areaAdminHelperNoLoc.rows[0].allowed).toBe(false);
+
+        const superHelperRes = await clientSuperAdmin.query(`SELECT public.can_admin_view_provider($1) AS allowed;`, [pAProfileId]);
+        expect(superHelperRes.rows[0].allowed).toBe(true);
+
+        // 7. Authorization tables remain strictly RLS-protected with NO broad SELECT policies
+        const rlsCheck = await adminClient.query(`
+          SELECT relname, relrowsecurity
+          FROM pg_class
+          WHERE relname IN ('user_roles', 'admin_area_assignments', 'provider_locations')
+            AND relnamespace = 'public'::regnamespace;
+        `);
+        expect(rlsCheck.rows.length).toBe(3);
+        for (const row of rlsCheck.rows) {
+          expect(row.relrowsecurity).toBe(true);
+        }
+
+        const policyCheck = await adminClient.query(`
+          SELECT tablename, policyname
+          FROM pg_policies
+          WHERE schemaname = 'public'
+            AND tablename IN ('user_roles', 'admin_area_assignments', 'provider_locations');
+        `);
+        expect(policyCheck.rows.length).toBe(0);
+
+        // Direct authenticated SELECTs return 0 rows under default-deny
+        const rolesCheck = await clientOrdinary.query(`SELECT * FROM public.user_roles;`);
+        expect(rolesCheck.rows.length).toBe(0);
+
+        const assignCheck = await clientAreaAdmin.query(`SELECT * FROM public.admin_area_assignments;`);
+        expect(assignCheck.rows.length).toBe(0);
+
+        const provLocCheck = await clientOrdinary.query(`SELECT * FROM public.provider_locations;`);
+        expect(provLocCheck.rows.length).toBe(0);
       } finally {
         await clientAreaAdmin.end();
         await clientSuperAdmin.end();

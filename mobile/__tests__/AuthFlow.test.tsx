@@ -32,32 +32,32 @@ jest.mock('../src/lib/supabase', () => ({
       signOut: jest.fn(),
       refreshSession: jest.fn(),
     },
+    rpc: jest.fn(),
   },
 }));
 
-describe('Complete Mobile Authentication Flow & State Integrity', () => {
+describe('Complete Mobile Authentication Flow & Authoritative Onboarding Gate', () => {
+  const mockUser = {
+    id: 'usr_authenticated_123',
+    phone: '+919876543210',
+  };
+  const mockSession = {
+    access_token: 'auth_session_jwt_token',
+    user: mockUser,
+  } as unknown as Session;
+
   beforeEach(() => {
     jest.clearAllMocks();
     mockCurrentSession = null;
     mockAuthStateListener = null;
   });
 
-  it('runs the full end-to-end flow: Login -> OTP -> Authenticated -> SignOut', async () => {
+  it('runs the full end-to-end flow: Login -> OTP -> Authenticated (Already Onboarded) -> SignOut', async () => {
     (supabase.auth.signInWithOtp as jest.Mock).mockResolvedValueOnce({
       error: null,
     });
 
-    const mockUser = {
-      id: 'usr_authenticated_123',
-      phone: '+919876543210',
-    };
-    const mockSession = {
-      access_token: 'auth_session_jwt_token',
-      user: mockUser,
-    } as unknown as Session;
-
     (supabase.auth.verifyOtp as jest.Mock).mockImplementationOnce(async () => {
-      // Simulate Supabase updating internal session and broadcasting authStateChange
       mockCurrentSession = mockSession;
       if (mockAuthStateListener) {
         mockAuthStateListener('SIGNED_IN', mockSession);
@@ -66,6 +66,12 @@ describe('Complete Mobile Authentication Flow & State Integrity', () => {
         data: { session: mockSession, user: mockUser },
         error: null,
       };
+    });
+
+    // Authoritative RPC returns already onboarded
+    (supabase.rpc as jest.Mock).mockResolvedValueOnce({
+      data: { is_onboarded: true, onboarded_at: '2026-09-30T10:00:00Z' },
+      error: null,
     });
 
     (supabase.auth.signOut as jest.Mock).mockImplementationOnce(async () => {
@@ -99,7 +105,7 @@ describe('Complete Mobile Authentication Flow & State Integrity', () => {
     fireEvent.changeText(getByTestId('otp-hidden-input'), '123456');
     fireEvent.press(getByTestId('otp-verify-button'));
 
-    // 5. Authoritative AuthContext session takes over; AuthenticatedPlaceholderScreen renders
+    // 5. Authoritative get_my_onboarding_status resolves true; AuthenticatedPlaceholderScreen renders
     await waitFor(() => {
       expect(getByText('Welcome!')).toBeTruthy();
       expect(getByTestId('authenticated-user-id').props.children).toBe('usr_authenticated_123');
@@ -115,6 +121,100 @@ describe('Complete Mobile Authentication Flow & State Integrity', () => {
     });
   });
 
+  it('FRESH USER FLOW: Login -> OTP -> Incomplete Onboarding -> Renders Onboarding Screen (Main app BLOCKED)', async () => {
+    (supabase.auth.signInWithOtp as jest.Mock).mockResolvedValueOnce({
+      error: null,
+    });
+
+    (supabase.auth.verifyOtp as jest.Mock).mockImplementationOnce(async () => {
+      mockCurrentSession = mockSession;
+      if (mockAuthStateListener) {
+        mockAuthStateListener('SIGNED_IN', mockSession);
+      }
+      return {
+        data: { session: mockSession, user: mockUser },
+        error: null,
+      };
+    });
+
+    // Authoritative RPC returns NOT onboarded
+    (supabase.rpc as jest.Mock).mockResolvedValueOnce({
+      data: { is_onboarded: false, onboarded_at: null },
+      error: null,
+    });
+
+    const { getByTestId, getByText, queryByTestId } = render(<App />);
+    await act(async () => {});
+
+    // Enter phone and OTP
+    fireEvent.changeText(getByTestId('login-phone-input'), '9876543210');
+    fireEvent.press(getByTestId('login-submit-button'));
+
+    await waitFor(() => {
+      expect(getByText('Enter Verification Code')).toBeTruthy();
+    });
+
+    fireEvent.changeText(getByTestId('otp-hidden-input'), '123456');
+    fireEvent.press(getByTestId('otp-verify-button'));
+
+    // Renders GeneralUserOnboardingScreen
+    await waitFor(() => {
+      expect(getByText('Complete Your Profile')).toBeTruthy();
+      expect(getByTestId('onboarding-fullname-input')).toBeTruthy();
+    });
+
+    // CRITICAL SECURITY INVARIANT: Main app must NOT be rendered
+    expect(queryByTestId('authenticated-user-id')).toBeNull();
+    expect(queryByTestId('sign-out-button')).toBeNull(); // Onboarding screen has onboarding-signout-button
+  });
+
+  it('FATAL ERROR FLOW: get_my_onboarding_status fails -> renders error screen with Retry and Sign Out', async () => {
+    (supabase.auth.signInWithOtp as jest.Mock).mockResolvedValueOnce({
+      error: null,
+    });
+
+    (supabase.auth.verifyOtp as jest.Mock).mockImplementationOnce(async () => {
+      mockCurrentSession = mockSession;
+      if (mockAuthStateListener) {
+        mockAuthStateListener('SIGNED_IN', mockSession);
+      }
+      return {
+        data: { session: mockSession, user: mockUser },
+        error: null,
+      };
+    });
+
+    // Authoritative RPC fails with P0002
+    (supabase.rpc as jest.Mock).mockResolvedValueOnce({
+      data: null,
+      error: { code: 'P0002', message: 'User profile not found' },
+    });
+
+    const { getByTestId, getByText, queryByTestId } = render(<App />);
+    await act(async () => {});
+
+    fireEvent.changeText(getByTestId('login-phone-input'), '9876543210');
+    fireEvent.press(getByTestId('login-submit-button'));
+
+    await waitFor(() => {
+      expect(getByText('Enter Verification Code')).toBeTruthy();
+    });
+
+    fireEvent.changeText(getByTestId('otp-hidden-input'), '123456');
+    fireEvent.press(getByTestId('otp-verify-button'));
+
+    // Renders error screen
+    await waitFor(() => {
+      expect(getByText('Unable to Load Profile')).toBeTruthy();
+      expect(getByTestId('onboarding-fatal-error-message')).toBeTruthy();
+      expect(getByTestId('onboarding-error-retry-button')).toBeTruthy();
+      expect(getByTestId('onboarding-error-signout-button')).toBeTruthy();
+    });
+
+    // Main app must NOT be rendered
+    expect(queryByTestId('authenticated-user-id')).toBeNull();
+  });
+
   it('allows user to change phone number from OTP screen and resets flow state', async () => {
     (supabase.auth.signInWithOtp as jest.Mock).mockResolvedValueOnce({
       error: null,
@@ -123,7 +223,6 @@ describe('Complete Mobile Authentication Flow & State Integrity', () => {
     const { getByTestId, getByText, queryByTestId } = render(<App />);
     await act(async () => {});
 
-    // Enter first number
     fireEvent.changeText(getByTestId('login-phone-input'), '9876543210');
     fireEvent.press(getByTestId('login-submit-button'));
 
@@ -131,13 +230,9 @@ describe('Complete Mobile Authentication Flow & State Integrity', () => {
       expect(getByText('+919876543210')).toBeTruthy();
     });
 
-    // Enter partial OTP
     fireEvent.changeText(getByTestId('otp-hidden-input'), '123');
-
-    // Tap "Edit phone number"
     fireEvent.press(getByTestId('otp-change-phone-button'));
 
-    // Back to Login screen
     await waitFor(() => {
       expect(getByText('Sign In / Register')).toBeTruthy();
       expect(queryByTestId('otp-hidden-input')).toBeNull();
@@ -145,7 +240,6 @@ describe('Complete Mobile Authentication Flow & State Integrity', () => {
   });
 
   it('SECURITY CHECK: codebase does not reference privileged service role environment variables', () => {
-    // Verify no secret variables are in the environment or files
     expect(process.env.SUPABASE_SERVICE_ROLE_KEY).toBeUndefined();
     expect(process.env.SERVICE_ROLE_KEY).toBeUndefined();
   });

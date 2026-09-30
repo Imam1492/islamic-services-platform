@@ -1633,14 +1633,27 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
       if (!isDbConnected) { expect(true).toBe(true); return; }
       const client = await createAuthClient(testUsers[2]);
       try {
+        // Capture pre-attempt state
+        const preUserRow = await adminClient.query(
+          `SELECT full_name, onboarded_at FROM public.users WHERE id = $1;`,
+          [testUsers[2].id]
+        );
+        const preFullName = preUserRow.rows[0].full_name;
+        const preOnboardedAt = preUserRow.rows[0].onboarded_at;
+
         // Attempt with invalid version
         await expect(
           client.query(`SELECT public.complete_user_onboarding('Valid Name', '', '2026-09-v1.0');`)
         ).rejects.toThrow();
 
-        // Verify users row was NOT modified
-        const userRow = await adminClient.query(`SELECT full_name, onboarded_at FROM public.users WHERE id = $1;`, [testUsers[2].id]);
-        expect(userRow.rows[0].full_name).toBe('User');
+        // Verify users row was NOT modified (remains identical to pre-attempt state)
+        const userRow = await adminClient.query(
+          `SELECT full_name, onboarded_at FROM public.users WHERE id = $1;`,
+          [testUsers[2].id]
+        );
+        expect(userRow.rows[0].full_name).toBe(preFullName);
+        expect(userRow.rows[0].full_name).not.toBe('Valid Name');
+        expect(userRow.rows[0].onboarded_at).toBe(preOnboardedAt);
         expect(userRow.rows[0].onboarded_at).toBeNull();
 
         // Verify no consent row was inserted

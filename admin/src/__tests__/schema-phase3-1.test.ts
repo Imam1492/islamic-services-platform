@@ -17,9 +17,9 @@ describe('Phase 3.1: F-02 Authoritative Identity & Phone Synchronization Schema 
     expect(fs.statSync(filePath).size).toBeGreaterThan(0);
   });
 
-  test('Exactly 7 canonical migrations exist in sequence (01, 02, 03, 04, 05, 06, 07)', () => {
+  test('Exactly 8 canonical migrations exist in sequence (01, 02, 03, 04, 05, 06, 07, 08)', () => {
     const sqlFiles = migrationFiles.filter((f) => f.endsWith('.sql'));
-    expect(sqlFiles.length).toBe(7);
+    expect(sqlFiles.length).toBe(8);
     expect(sqlFiles[0]).toContain('01_core_and_locations');
     expect(sqlFiles[1]).toContain('02_providers_and_verification');
     expect(sqlFiles[2]).toContain('03_requests_chat_and_audit');
@@ -27,12 +27,33 @@ describe('Phase 3.1: F-02 Authoritative Identity & Phone Synchronization Schema 
     expect(sqlFiles[4]).toContain('05_auth_identity_and_phone_sync');
     expect(sqlFiles[5]).toContain('06_least_privilege_chat_and_provider_access');
     expect(sqlFiles[6]).toContain('07_user_onboarding_and_consent');
+    expect(sqlFiles[7]).toContain('08_authoritative_onboarding_status');
 
     // Confirm no 0-byte migrations
     for (const f of sqlFiles) {
       const stat = fs.statSync(path.join(migrationsDir, f));
       expect(stat.size).toBeGreaterThan(0);
     }
+  });
+
+  test('Migration 08 defines get_my_onboarding_status with hardened SECURITY DEFINER and least-privilege grants', () => {
+    const phase32bMigrationFile = migrationFiles.find((f) =>
+      f.includes('08_authoritative_onboarding_status')
+    );
+    expect(phase32bMigrationFile).toBeDefined();
+    const filePath = path.join(migrationsDir, phase32bMigrationFile!);
+    const content = fs.readFileSync(filePath, 'utf8');
+
+    expect(content).toContain('CREATE OR REPLACE FUNCTION public.get_my_onboarding_status()');
+    expect(content).toContain('RETURNS jsonb');
+    expect(content).toContain('STABLE');
+    expect(content).toContain('SECURITY DEFINER');
+    expect(content).toContain('SET search_path = pg_catalog, public, pg_temp');
+    expect(content).toContain('REVOKE EXECUTE ON FUNCTION public.get_my_onboarding_status() FROM PUBLIC;');
+    expect(content).toContain('REVOKE EXECUTE ON FUNCTION public.get_my_onboarding_status() FROM anon;');
+    expect(content).toContain('GRANT EXECUTE ON FUNCTION public.get_my_onboarding_status() TO authenticated, service_role;');
+    // Confirms no parameters are defined
+    expect(content).toMatch(/CREATE OR REPLACE FUNCTION public\.get_my_onboarding_status\(\s*\)/);
   });
 
   test('Migration 05 defines handle_new_auth_user with hardened SECURITY DEFINER and search_path', () => {

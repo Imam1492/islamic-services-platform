@@ -1680,4 +1680,240 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
       ).rejects.toThrow(/append-only and immutable/i);
     });
   });
+
+  // ==========================================================================
+  // 6. PHASE 3.2 STEP 2B: AUTHORITATIVE ONBOARDING STATUS RPC TESTS
+  // ==========================================================================
+
+  describe('Phase 3.2 Step 2B: Authoritative Onboarding Status RPC Tests', () => {
+    const statusUserAId = randomUUID();
+    const statusUserBId = randomUUID();
+    const statusUserA: TestUser = {
+      id: statusUserAId,
+      name: 'Status User A',
+      phone: '+12025550301',
+      token: generateSupabaseJwt(statusUserAId),
+    };
+    const statusUserB: TestUser = {
+      id: statusUserBId,
+      name: 'Status User B',
+      phone: '+12025550302',
+      token: generateSupabaseJwt(statusUserBId),
+    };
+
+    beforeAll(async () => {
+      if (!isDbConnected) return;
+
+      // Provision simulated fresh users who just completed phone OTP
+      await adminClient.query(
+        `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
+         VALUES ($1, $2, $3, '{}'::jsonb);`,
+        [statusUserA.id, `${statusUserA.id}@example.com`, statusUserA.phone]
+      );
+
+      await adminClient.query(
+        `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
+         VALUES ($1, $2, $3, '{}'::jsonb);`,
+        [statusUserB.id, `${statusUserB.id}@example.com`, statusUserB.phone]
+      );
+    });
+
+    test('STATUS-NEG-01: Anonymous / unauthenticated caller cannot execute get_my_onboarding_status()', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const anonClient = new Client({ connectionString: DB_URL });
+      await anonClient.connect();
+      try {
+        await anonClient.query(`SET ROLE anon;`);
+        await expect(
+          anonClient.query(`SELECT public.get_my_onboarding_status();`)
+        ).rejects.toThrow(/permission denied/i);
+      } finally {
+        await anonClient.end();
+      }
+    });
+
+    test('STATUS-POS-01: Authenticated User A with onboarded_at NULL receives is_onboarded: false and onboarded_at: null', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const client = await createAuthClient(statusUserA);
+      try {
+        const res = await client.query(`SELECT public.get_my_onboarding_status() as status;`);
+        const status = res.rows[0].status;
+        expect(status).toEqual({
+          is_onboarded: false,
+          onboarded_at: null,
+        });
+      } finally {
+        await client.end();
+      }
+    });
+
+    test('STATUS-POS-02: After User A completes legitimate onboarding, get_my_onboarding_status() returns is_onboarded: true and valid timestamp', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const client = await createAuthClient(statusUserA);
+      try {
+        // Complete onboarding via legitimate RPC
+        const onboardRes = await client.query(
+          `SELECT public.complete_user_onboarding('Ahmad Status Test', '2026-09-v1.0', '2026-09-v1.0') as payload;`
+        );
+        const expectedOnboardedAt = onboardRes.rows[0].payload.onboarded_at;
+
+        // Query status via get_my_onboarding_status()
+        const res = await client.query(`SELECT public.get_my_onboarding_status() as status;`);
+        const status = res.rows[0].status;
+
+        expect(status.is_onboarded).toBe(true);
+        expect(status.onboarded_at).toBeDefined();
+        expect(new Date(status.onboarded_at).toISOString()).toBe(new Date(expectedOnboardedAt).toISOString());
+      } finally {
+        await client.end();
+      }
+    });
+
+    test('STATUS-NEG-02: Function has zero parameters (verified via PostgreSQL metadata)', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const paramCheck = await adminClient.query(`
+        SELECT parameter_name, data_type
+        FROM information_schema.parameters
+        WHERE specific_schema = 'public'
+          AND specific_name LIKE 'get_my_onboarding_status%'
+        ORDER BY ordinal_position;
+      `);
+      expect(paramCheck.rows.length).toBe(0);
+    });
+
+    test('STATUS-NEG-03: User A cannot use any parameter or mechanism to request User B state', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const clientA = await createAuthClient(statusUserA);
+      const clientB = await createAuthClient(statusUserB);
+      try {
+        // User B has not completed onboarding
+        const resB = await clientB.query(`SELECT public.get_my_onboarding_status() as status;`);
+        expect(resB.rows[0].status.is_onboarded).toBe(false);
+
+        // User A cannot pass arguments to probe User B
+        await expect(
+          clientA.query(`SELECT public.get_my_onboarding_status($1);`, [statusUserB.id])
+        ).rejects.toThrow();
+
+        // User A query strictly returns User A status (which is onboarded), never User B
+        const resA = await clientA.query(`SELECT public.get_my_onboarding_status() as status;`);
+        expect(resA.rows[0].status.is_onboarded).toBe(true);
+      } finally {
+        await clientA.end();
+        await clientB.end();
+      }
+    });
+
+    test('STATUS-NEG-04: Returned JSON keys are EXACTLY is_onboarded and onboarded_at (no private PII exposed)', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const client = await createAuthClient(statusUserA);
+      try {
+        const res = await client.query(`SELECT public.get_my_onboarding_status() as status;`);
+        const status = res.rows[0].status;
+        const keys = Object.keys(status).sort();
+
+        // Must strictly contain ONLY is_onboarded and onboarded_at
+        expect(keys).toEqual(['is_onboarded', 'onboarded_at']);
+
+        // Explicitly assert absence of sensitive fields
+        expect((status as any).user_id).toBeUndefined();
+        expect((status as any).id).toBeUndefined();
+        expect((status as any).full_name).toBeUndefined();
+        expect((status as any).phone).toBeUndefined();
+        expect((status as any).email).toBeUndefined();
+        expect((status as any).role).toBeUndefined();
+        expect((status as any).consent_id).toBeUndefined();
+      } finally {
+        await client.end();
+      }
+    });
+
+    test('STATUS-NEG-05: Calling RPC does not mutate public.users or create audit records', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const client = await createAuthClient(statusUserA);
+      try {
+        // Capture pre-invocation state
+        const preUserRow = await adminClient.query(
+          `SELECT updated_at, onboarded_at FROM public.users WHERE id = $1;`,
+          [statusUserA.id]
+        );
+        const preAuditCount = await adminClient.query(
+          `SELECT COUNT(*)::int as count FROM public.audit_logs WHERE actor_id = $1;`,
+          [statusUserA.id]
+        );
+
+        // Execute status RPC multiple times
+        await client.query(`SELECT public.get_my_onboarding_status();`);
+        await client.query(`SELECT public.get_my_onboarding_status();`);
+
+        // Verify public.users row is completely unchanged
+        const postUserRow = await adminClient.query(
+          `SELECT updated_at, onboarded_at FROM public.users WHERE id = $1;`,
+          [statusUserA.id]
+        );
+        expect(postUserRow.rows[0].updated_at).toEqual(preUserRow.rows[0].updated_at);
+        expect(postUserRow.rows[0].onboarded_at).toEqual(preUserRow.rows[0].onboarded_at);
+
+        // Verify no audit log entry was created
+        const postAuditCount = await adminClient.query(
+          `SELECT COUNT(*)::int as count FROM public.audit_logs WHERE actor_id = $1;`,
+          [statusUserA.id]
+        );
+        expect(postAuditCount.rows[0].count).toBe(preAuditCount.rows[0].count);
+      } finally {
+        await client.end();
+      }
+    });
+
+    test('STATUS-NEG-06: Missing public.users row fails closed with explicit error, never returning is_onboarded=false', async () => {
+      if (!isDbConnected) { expect(true).toBe(true); return; }
+      const orphanUserId = randomUUID();
+      const orphanUser: TestUser = {
+        id: orphanUserId,
+        name: 'Orphan User',
+        phone: '+12025550309',
+        token: generateSupabaseJwt(orphanUserId),
+      };
+
+      // 1. Provision user in auth.users
+      await adminClient.query(
+        `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
+         VALUES ($1, $2, $3, '{}'::jsonb);`,
+        [orphanUser.id, `${orphanUser.id}@example.com`, orphanUser.phone]
+      );
+
+      // 2. Intentionally delete corresponding public.users row to simulate corrupted/missing profile
+      await adminClient.query(`DELETE FROM public.users WHERE id = $1;`, [orphanUser.id]);
+
+      // 3. Connect as the authenticated orphan user
+      const orphanClient = await createAuthClient(orphanUser);
+      try {
+        let caughtError: any = null;
+        try {
+          await orphanClient.query(`SELECT public.get_my_onboarding_status();`);
+        } catch (err) {
+          caughtError = err;
+        }
+
+        // Must fail explicitly
+        expect(caughtError).not.toBeNull();
+        expect(caughtError.message).toMatch(/User profile not found/i);
+
+        // Must not expose PII or internal database details
+        expect(caughtError.message).not.toContain(orphanUser.phone);
+        expect(caughtError.message).not.toContain(orphanUser.id);
+        expect(caughtError.message).not.toContain('table');
+        expect(caughtError.message).not.toContain('public.users');
+
+        // Verify zero mutations to public.users or public.audit_logs
+        const usersCheck = await adminClient.query(`SELECT * FROM public.users WHERE id = $1;`, [orphanUser.id]);
+        expect(usersCheck.rows.length).toBe(0);
+
+        const auditCheck = await adminClient.query(`SELECT * FROM public.audit_logs WHERE actor_id = $1;`, [orphanUser.id]);
+        expect(auditCheck.rows.length).toBe(0);
+      } finally {
+        await orphanClient.end();
+      }
+    });
+  });
 });

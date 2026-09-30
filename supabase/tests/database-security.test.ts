@@ -13,6 +13,7 @@
 import { Client } from 'pg';
 import * as jwtLib from 'jsonwebtoken';
 const jwt: typeof import('jsonwebtoken') = (jwtLib as any).default ?? jwtLib;
+import { randomUUID } from 'crypto';
 
 // Types & Config
 interface TestUser {
@@ -1333,9 +1334,10 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
   // ==========================================================================
 
   describe('Phase 3.2 Step 2A: Database Onboarding & Consent Foundation Tests', () => {
-    const obUser1Id = '88888888-8888-4888-8888-888888888881';
-    const obUser2Id = '88888888-8888-4888-8888-888888888882';
-    const obUser3Id = '88888888-8888-4888-8888-888888888883';
+    // Generate isolated random fixture UUIDs per test execution to prevent cross-run collisions
+    const obUser1Id = randomUUID();
+    const obUser2Id = randomUUID();
+    const obUser3Id = randomUUID();
 
     const testUsers = [
       { id: obUser1Id, name: 'User', phone: '+12025550201', token: generateSupabaseJwt(obUser1Id) },
@@ -1345,14 +1347,6 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
 
     beforeAll(async () => {
       if (!isDbConnected) return;
-
-      // Cleanup any pre-existing records
-      await adminClient.query(`DELETE FROM public.audit_logs WHERE actor_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
-      await adminClient.query(`DELETE FROM public.user_consents WHERE user_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
-      await adminClient.query(`DELETE FROM public.user_roles WHERE user_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
-      await adminClient.query(`DELETE FROM public.user_private WHERE user_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
-      await adminClient.query(`DELETE FROM public.users WHERE id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
-      await adminClient.query(`DELETE FROM auth.users WHERE id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
 
       // Provision simulated fresh users who just completed phone OTP (name defaults to 'User', onboarded_at is NULL)
       for (const u of testUsers) {
@@ -1365,13 +1359,11 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     afterAll(async () => {
-      if (!isDbConnected) return;
-      await adminClient.query(`DELETE FROM public.audit_logs WHERE actor_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
-      await adminClient.query(`DELETE FROM public.user_consents WHERE user_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
-      await adminClient.query(`DELETE FROM public.user_roles WHERE user_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
-      await adminClient.query(`DELETE FROM public.user_private WHERE user_id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
-      await adminClient.query(`DELETE FROM public.users WHERE id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
-      await adminClient.query(`DELETE FROM auth.users WHERE id IN ($1, $2, $3);`, [obUser1Id, obUser2Id, obUser3Id]);
+      // NOTE: Audit logs (public.audit_logs) and user consents (public.user_consents)
+      // are strictly append-only and immutable by database triggers and architectural design.
+      // Therefore, they are not mutated or deleted during cleanup.
+      // Each test run uses fresh isolated random UUIDs, and the CI environment resets
+      // the test database per run via 'supabase db reset'.
     });
 
     test('ONBOARD-NEG-01: Anonymous / unauthenticated caller cannot execute complete_user_onboarding', async () => {

@@ -17,15 +17,16 @@ describe('Phase 3.1: F-02 Authoritative Identity & Phone Synchronization Schema 
     expect(fs.statSync(filePath).size).toBeGreaterThan(0);
   });
 
-  test('Exactly 6 canonical migrations exist in sequence (01, 02, 03, 04, 05, 06)', () => {
+  test('Exactly 7 canonical migrations exist in sequence (01, 02, 03, 04, 05, 06, 07)', () => {
     const sqlFiles = migrationFiles.filter((f) => f.endsWith('.sql'));
-    expect(sqlFiles.length).toBe(6);
+    expect(sqlFiles.length).toBe(7);
     expect(sqlFiles[0]).toContain('01_core_and_locations');
     expect(sqlFiles[1]).toContain('02_providers_and_verification');
     expect(sqlFiles[2]).toContain('03_requests_chat_and_audit');
     expect(sqlFiles[3]).toContain('04_request_state_machine_and_security');
     expect(sqlFiles[4]).toContain('05_auth_identity_and_phone_sync');
     expect(sqlFiles[5]).toContain('06_least_privilege_chat_and_provider_access');
+    expect(sqlFiles[6]).toContain('07_user_onboarding_and_consent');
 
     // Confirm no 0-byte migrations
     for (const f of sqlFiles) {

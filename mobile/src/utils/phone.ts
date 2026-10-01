@@ -181,3 +181,33 @@ export function getSafeAuthErrorMessage(
 
   return 'An unexpected error occurred. Please try again.';
 }
+
+/**
+ * Masks a phone number string for privacy-compliant UI display.
+ * Retains the country code prefix (if present) and the last 4 digits,
+ * replacing the remaining subscriber digits with masked bullets.
+ * Example: "+919876543210" -> "+91 ••••• •3210"
+ */
+export function maskPhone(phone: string | null | undefined): string {
+  if (!phone) return '';
+  const clean = phone.trim();
+  if (clean.length <= 4) return '••••';
+
+  if (clean.startsWith('+')) {
+    const match = clean.match(/^(\+\d{1,3})(\d+)$/);
+    if (match) {
+      const countryCode = match[1];
+      const subscriber = match[2];
+      if (subscriber.length <= 4) {
+        return `${countryCode} ••••`;
+      }
+      const lastFour = subscriber.slice(-4);
+      const maskedLength = subscriber.length - 4;
+      const bullets = '•'.repeat(Math.min(maskedLength, 5));
+      return `${countryCode} ${bullets} ${lastFour}`;
+    }
+  }
+
+  const lastFour = clean.slice(-4);
+  return `•••• ••${lastFour}`;
+}

@@ -105,19 +105,23 @@ describe('Complete Mobile Authentication Flow & Authoritative Onboarding Gate', 
     fireEvent.changeText(getByTestId('otp-hidden-input'), '123456');
     fireEvent.press(getByTestId('otp-verify-button'));
 
-    // 5. Authoritative get_my_onboarding_status resolves true; AuthenticatedPlaceholderScreen renders
+    // 5. Authoritative get_my_onboarding_status resolves true; AuthenticatedTabNavigator renders
     await waitFor(() => {
-      expect(getByText('Welcome!')).toBeTruthy();
-      expect(getByTestId('authenticated-user-id').props.children).toBe('usr_authenticated_123');
-      expect(getByTestId('authenticated-user-phone').props.children).toBe('+919876543210');
+      expect(getByTestId('authenticated-tab-navigator')).toBeTruthy();
+      expect(getByTestId('discover-shell-screen')).toBeTruthy();
     });
 
-    // 6. Sign out returns cleanly to LoginScreen
-    fireEvent.press(getByTestId('sign-out-button'));
+    // 6. Navigate to Account tab and sign out
+    fireEvent.press(getByTestId('tab-button-account'));
+    await waitFor(() => {
+      expect(getByTestId('account-shell-screen')).toBeTruthy();
+    });
+
+    fireEvent.press(getByTestId('account-signout-button'));
 
     await waitFor(() => {
       expect(getByText('Sign In / Register')).toBeTruthy();
-      expect(queryByTestId('authenticated-user-id')).toBeNull();
+      expect(queryByTestId('authenticated-tab-navigator')).toBeNull();
     });
   });
 
@@ -164,8 +168,9 @@ describe('Complete Mobile Authentication Flow & Authoritative Onboarding Gate', 
     });
 
     // CRITICAL SECURITY INVARIANT: Main app must NOT be rendered
-    expect(queryByTestId('authenticated-user-id')).toBeNull();
-    expect(queryByTestId('sign-out-button')).toBeNull(); // Onboarding screen has onboarding-signout-button
+    expect(queryByTestId('authenticated-tab-navigator')).toBeNull();
+    expect(queryByTestId('account-shell-screen')).toBeNull();
+    expect(queryByTestId('account-signout-button')).toBeNull(); // Onboarding screen has onboarding-signout-button
   });
 
   it('FATAL ERROR FLOW: get_my_onboarding_status fails -> renders error screen with Retry and Sign Out', async () => {
@@ -212,7 +217,8 @@ describe('Complete Mobile Authentication Flow & Authoritative Onboarding Gate', 
     });
 
     // Main app must NOT be rendered
-    expect(queryByTestId('authenticated-user-id')).toBeNull();
+    expect(queryByTestId('authenticated-tab-navigator')).toBeNull();
+    expect(queryByTestId('account-shell-screen')).toBeNull();
   });
 
   it('allows user to change phone number from OTP screen and resets flow state', async () => {

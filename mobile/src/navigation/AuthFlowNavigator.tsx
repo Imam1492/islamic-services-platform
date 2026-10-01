@@ -5,7 +5,7 @@ import { useOnboardingStatus } from '../hooks/useOnboardingStatus';
 import { LoginScreen } from '../screens/LoginScreen';
 import { OtpVerificationScreen } from '../screens/OtpVerificationScreen';
 import { GeneralUserOnboardingScreen } from '../screens/GeneralUserOnboardingScreen';
-import { AuthenticatedPlaceholderScreen } from '../screens/AuthenticatedPlaceholderScreen';
+import { AuthenticatedTabNavigator } from './AuthenticatedTabNavigator';
 
 export type AuthFlowStep = 'login' | 'otp';
 
@@ -39,6 +39,7 @@ function AuthenticatedFlow({ userId }: { userId: string }) {
   const { signOut } = useAuth();
   const {
     step,
+    onboardedAt,
     error,
     isSubmitting,
     refreshStatus,
@@ -106,8 +107,8 @@ function AuthenticatedFlow({ userId }: { userId: string }) {
     );
   }
 
-  // step === 'ONBOARDED': Authoritative main app screen
-  return <AuthenticatedPlaceholderScreen />;
+  // step === 'ONBOARDED': Authoritative main app shell
+  return <AuthenticatedTabNavigator onboardedAt={onboardedAt} />;
 }
 
 export function AuthFlowNavigator() {

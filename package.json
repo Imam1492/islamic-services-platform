@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test:db": "jest --config jest.config.cjs supabase/tests/database-security.test.ts"
+    "test:db": "jest --config jest.config.cjs supabase/tests/database-security.test.ts supabase/tests/discovery-security.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

@@ -693,17 +693,56 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     test('25. Inactive services/areas do not appear in provider profile', async () => {
       if (!isDbConnected) { expect(true).toBe(true); return; }
       const client = await createAuthClient(testUser);
+      let tempAreaId: string | null = null;
+      let tempServiceId: string | null = null;
       try {
-        // Attach inactive area & inactive service to approved provider
+        // Step A: Create Area and Service as ACTIVE through valid production transitions
+        // Lookup parent city of areaAId to maintain valid location hierarchy
+        const cityRes = await adminClient.query(
+          `SELECT parent_id FROM public.locations WHERE id = $1;`,
+          [areaAId]
+        );
+        const cityId = cityRes.rows[0].parent_id;
+
+        const areaRes = await adminClient.query(
+          `INSERT INTO public.locations (name, level, parent_id, is_active)
+           VALUES ('Disc Test Active-Then-Inactive Area', 'area', $1, true)
+           RETURNING id;`,
+          [cityId]
+        );
+        tempAreaId = areaRes.rows[0].id;
+
+        const tempSlug = `disc-deact-serv-${randomInt(100000, 1000000)}`;
+        const servRes = await adminClient.query(
+          `INSERT INTO public.services (category_id, name, slug, is_active)
+           VALUES ($1, 'Disc Test Active-Then-Inactive Service', $2, true)
+           RETURNING id;`,
+          [catAId, tempSlug]
+        );
+        tempServiceId = servRes.rows[0].id;
+
+        // Step B: Associate the approved provider with the active Area & Service
+        // This satisfies trg_validate_provider_location_area which permits associations only for active areas
         await adminClient.query(
-          `INSERT INTO public.provider_locations (provider_id, location_id) VALUES ($1, $2) ON CONFLICT DO NOTHING;`,
-          [approvedProvId, inactiveAreaId]
+          `INSERT INTO public.provider_locations (provider_id, location_id) VALUES ($1, $2);`,
+          [approvedProvId, tempAreaId]
         );
         await adminClient.query(
-          `INSERT INTO public.provider_services (provider_id, service_id) VALUES ($1, $2) ON CONFLICT DO NOTHING;`,
-          [approvedProvId, inactiveServiceId]
+          `INSERT INTO public.provider_services (provider_id, service_id) VALUES ($1, $2);`,
+          [approvedProvId, tempServiceId]
         );
 
+        // Step C: Deactivate the Area and Service after the valid association exists
+        await adminClient.query(
+          `UPDATE public.locations SET is_active = false WHERE id = $1;`,
+          [tempAreaId]
+        );
+        await adminClient.query(
+          `UPDATE public.services SET is_active = false WHERE id = $1;`,
+          [tempServiceId]
+        );
+
+        // Step D: Query public provider profile via client
         const res = await client.query(
           `SELECT public.get_public_provider_profile($1) as profile;`,
           [approvedProvId]
@@ -713,9 +752,37 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
         const areaIds = prof.areas.map((a: any) => a.id);
         const servIds = prof.services.map((s: any) => s.id);
 
+        // Step E: Assert inactive area and service do NOT appear in public provider profile
+        expect(areaIds).not.toContain(tempAreaId);
+        expect(servIds).not.toContain(tempServiceId);
         expect(areaIds).not.toContain(inactiveAreaId);
         expect(servIds).not.toContain(inactiveServiceId);
+
+        // Verify active areas and services remain present
+        expect(areaIds).toContain(areaAId);
+        expect(servIds).toContain(serviceAId);
       } finally {
+        // Cleanup test fixtures created specifically for test #25
+        if (tempAreaId) {
+          await adminClient.query(
+            `DELETE FROM public.provider_locations WHERE provider_id = $1 AND location_id = $2;`,
+            [approvedProvId, tempAreaId]
+          ).catch(() => {});
+          await adminClient.query(
+            `DELETE FROM public.locations WHERE id = $1;`,
+            [tempAreaId]
+          ).catch(() => {});
+        }
+        if (tempServiceId) {
+          await adminClient.query(
+            `DELETE FROM public.provider_services WHERE provider_id = $1 AND service_id = $2;`,
+            [approvedProvId, tempServiceId]
+          ).catch(() => {});
+          await adminClient.query(
+            `DELETE FROM public.services WHERE id = $1;`,
+            [tempServiceId]
+          ).catch(() => {});
+        }
         await client.end();
       }
     });

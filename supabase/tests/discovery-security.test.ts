@@ -36,6 +36,7 @@ import * as jwtLib from 'jsonwebtoken';
 const jwt: typeof import('jsonwebtoken') = (jwtLib as any).default ?? jwtLib;
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomInt } from 'crypto';
 
 interface TestUser {
   id: string;
@@ -260,6 +261,9 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     let wrongAreaProvId: string;
     let wrongServiceProvId: string;
 
+    const createdUserIds: string[] = [];
+    const createdProviderIds: string[] = [];
+
     beforeAll(async () => {
       if (!isDbConnected) return;
 
@@ -324,19 +328,49 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
       inactiveServiceId = inactServRes.rows[0].id;
       serviceUnderInactiveCatId = servUnderInactCatRes.rows[0].id;
 
+      // Deterministic per-run sequence and high-entropy run token:
+      // E.164 pattern: ^\+[1-9]\d{1,14}$
+      // Conforms to realistic Indian mobile format (+91 followed by 10 national digits starting with 9)
+      let providerSeq = 0;
+      // High-entropy 6-digit run token (domain of 900,000 values: 100000 - 999999):
+      const runToken = randomInt(100000, 1000000);
+
+      /**
+       * Generates a valid E.164 phone number with the following guarantees:
+       * 1. INTRA-RUN UNIQUENESS (STRICT): Monotonically incrementing providerSeq guarantees
+       *    that every provider created within a single test run receives a strictly distinct
+       *    phone number, preventing users_phone_key uniqueness violations.
+       * 2. CROSS-RUN COLLISION MITIGATION: The 6-digit cryptographically random runToken
+       *    provides 900,000 distinct buckets across process runs.
+       * 3. TEARDOWN RELIANCE: This does NOT claim absolute collision safety across indefinite
+       *    re-runs on a persistent unreset database without teardown. Instead, cross-run reuse
+       *    relies upon the afterAll hook to delete created auth.users / provider records, as
+       *    well as CI ephemeral database resets (supabase db reset).
+       */
+      function generateUniqueTestPhone(): string {
+        providerSeq += 1;
+        const seqStr = String(providerSeq).padStart(3, '0');
+        return `+919${runToken}${seqStr}`;
+      }
+
       // Helper to provision provider
       async function createTestProvider(name: string, status: string, gender: string, exp: number, areaId: string, servId: string) {
+        const testPhone = generateUniqueTestPhone();
+        const testEmail = `${name.toLowerCase().replace(/\s+/g, '')}_${providerSeq}@example.com`;
         const uId = (await adminClient.query(
           `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
-           VALUES (gen_random_uuid(), '${name.toLowerCase().replace(/\s+/g, '')}@example.com', '+919876543210', '{"full_name":"${name}"}'::jsonb)
-           RETURNING id;`
+           VALUES (gen_random_uuid(), $1, $2, jsonb_build_object('full_name', $3::text))
+           RETURNING id;`,
+          [testEmail, testPhone, name]
         )).rows[0].id;
+        createdUserIds.push(uId);
 
         const profId = (await adminClient.query(
           `INSERT INTO public.provider_profiles (user_id, bio, gender, years_experience, status)
-           VALUES ($1, 'Bio for ${name}', '${gender}', ${exp}, '${status}') RETURNING id;`,
-          [uId]
+           VALUES ($1, 'Bio for ' || $2::text, $3, $4, $5) RETURNING id;`,
+          [uId, name, gender, exp, status]
         )).rows[0].id;
+        createdProviderIds.push(profId);
 
         await adminClient.query(
           `INSERT INTO public.provider_locations (provider_id, location_id) VALUES ($1, $2);`,
@@ -806,6 +840,29 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
         WHERE tgname = 'trg_sync_provider_badges';
       `);
       expect(trgRes.rows.length).toBe(1);
+    });
+
+    afterAll(async () => {
+      if (!isDbConnected || !adminClient) return;
+      try {
+        for (const provId of createdProviderIds) {
+          await adminClient.query(`DELETE FROM public.provider_badges WHERE provider_id = $1;`, [provId]);
+          await adminClient.query(`DELETE FROM public.provider_locations WHERE provider_id = $1;`, [provId]);
+          await adminClient.query(`DELETE FROM public.provider_services WHERE provider_id = $1;`, [provId]);
+          await adminClient.query(`DELETE FROM public.provider_profiles WHERE id = $1;`, [provId]);
+        }
+        for (const uId of createdUserIds) {
+          await adminClient.query(`DELETE FROM public.user_roles WHERE user_id = $1;`, [uId]);
+          await adminClient.query(`DELETE FROM public.user_private WHERE user_id = $1;`, [uId]);
+          await adminClient.query(`DELETE FROM public.users WHERE id = $1;`, [uId]);
+          await adminClient.query(`DELETE FROM auth.users WHERE id = $1;`, [uId]);
+        }
+      } catch (err) {
+        // Safe logging if cleanup encounters non-fatal issue
+      }
+      // Note: Immutable audit_logs (public.audit_logs) and user consents (public.user_consents)
+      // are strictly append-only and immutable by database triggers and architectural design.
+      // Therefore, they are not mutated or deleted during cleanup.
     });
   });
 });

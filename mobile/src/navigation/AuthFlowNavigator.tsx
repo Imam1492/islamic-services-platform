@@ -1,42 +1,17 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { StyleSheet, View, ActivityIndicator, Text, Pressable } from 'react-native';
 import { useAuth } from '../context/AuthContext';
 import { useOnboardingStatus } from '../hooks/useOnboardingStatus';
 import { LoginScreen } from '../screens/LoginScreen';
-import { OtpVerificationScreen } from '../screens/OtpVerificationScreen';
 import { GeneralUserOnboardingScreen } from '../screens/GeneralUserOnboardingScreen';
 import { AuthenticatedTabNavigator } from './AuthenticatedTabNavigator';
 
-export type AuthFlowStep = 'login' | 'otp';
-
 function UnauthenticatedFlow() {
-  const [step, setStep] = useState<AuthFlowStep>('login');
-  const [pendingPhone, setPendingPhone] = useState<string | null>(null);
-
-  if (step === 'otp' && pendingPhone) {
-    return (
-      <OtpVerificationScreen
-        phone={pendingPhone}
-        onChangePhone={() => {
-          setPendingPhone(null);
-          setStep('login');
-        }}
-      />
-    );
-  }
-
-  return (
-    <LoginScreen
-      onOtpSent={(canonicalPhone) => {
-        setPendingPhone(canonicalPhone);
-        setStep('otp');
-      }}
-    />
-  );
+  return <LoginScreen />;
 }
 
 function AuthenticatedFlow({ userId }: { userId: string }) {
-  const { signOut } = useAuth();
+  const { session, signOut } = useAuth();
   const {
     step,
     onboardedAt,
@@ -96,8 +71,15 @@ function AuthenticatedFlow({ userId }: { userId: string }) {
   }
 
   if (step === 'NOT_ONBOARDED') {
+    const rawMeta = session?.user?.user_metadata;
+    const prefillName =
+      (typeof rawMeta?.full_name === 'string' && rawMeta.full_name) ||
+      (typeof rawMeta?.name === 'string' && rawMeta.name) ||
+      '';
+
     return (
       <GeneralUserOnboardingScreen
+        initialFullName={prefillName}
         onSubmit={async (fullName) => {
           return await submitOnboarding(fullName);
         }}
@@ -175,15 +157,14 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#4B5563',
     textAlign: 'center',
-    marginBottom: 20,
     lineHeight: 20,
+    marginBottom: 20,
   },
   retryButton: {
     width: '100%',
     backgroundColor: '#2563EB',
-    height: 48,
     borderRadius: 10,
-    justifyContent: 'center',
+    paddingVertical: 12,
     alignItems: 'center',
     marginBottom: 12,
   },
@@ -197,6 +178,7 @@ const styles = StyleSheet.create({
   },
   signOutLink: {
     paddingVertical: 8,
+    paddingHorizontal: 16,
   },
   signOutLinkText: {
     color: '#6B7280',
@@ -204,4 +186,3 @@ const styles = StyleSheet.create({
     fontWeight: '500',
   },
 });
-

@@ -34,15 +34,28 @@ export function toE164(countryCode: string, nationalNumber: string): string {
 
   let digits = cleanDigits(nationalNumber);
 
-  // If user included country code digits in national input by accident, trim it
   const codeDigits = cleanDigits(cleanCode);
-  if (digits.startsWith(codeDigits) && digits.length > codeDigits.length) {
-    digits = digits.slice(codeDigits.length);
-  }
 
-  // Handle leading 0 commonly used in Indian trunk dialing (e.g., 09876543210 -> 9876543210)
-  if (cleanCode === '+91' && digits.length === 11 && digits.startsWith('0')) {
-    digits = digits.slice(1);
+  // Handle India (+91)
+  if (codeDigits === '91') {
+    // Trunk prefix '0' (11 digits: 0 + 10-digit mobile)
+    if (digits.length === 11 && digits.startsWith('0')) {
+      digits = digits.slice(1);
+    }
+    // Accidental country code duplication (12 digits: 91 + 10-digit mobile)
+    else if (digits.length === 12 && digits.startsWith('91')) {
+      digits = digits.slice(2);
+    }
+  } else {
+    // For other countries: only strip country code prefix if total digits exceed expected national length
+    const country = SUPPORTED_COUNTRIES.find((c) => cleanDigits(c.code) === codeDigits);
+    const expectedDigits = country?.digits ?? 10;
+    if (
+      digits.startsWith(codeDigits) &&
+      digits.length === expectedDigits + codeDigits.length
+    ) {
+      digits = digits.slice(codeDigits.length);
+    }
   }
 
   return `${cleanCode}${digits}`;
@@ -74,9 +87,12 @@ export function validatePhoneInput(
   }
 
   const canonical = toE164(countryCode, nationalNumber);
+  const cleanCode = countryCode.startsWith('+')
+    ? countryCode.trim()
+    : `+${countryCode.replace(/\D/g, '')}`;
 
   // India (+91) specific mobile validation: exactly 10 digits starting with 6, 7, 8, or 9
-  if (countryCode === '+91') {
+  if (cleanCode === '+91' || cleanDigits(countryCode) === '91') {
     const subscriber = cleanDigits(canonical.replace(/^\+91/, ''));
     if (subscriber.length !== 10) {
       return {
@@ -124,8 +140,9 @@ export function getSafeAuthErrorMessage(
 ): string {
   if (!error) return '';
 
-  const errObj = error as { message?: string; status?: number };
-  const message = typeof errObj?.message === 'string' ? errObj.message.toLowerCase() : '';
+  const errObj = error as { message?: string; status?: number; error_description?: string };
+  const rawMessage = errObj?.message || errObj?.error_description || '';
+  const message = typeof rawMessage === 'string' ? rawMessage.toLowerCase() : '';
   const status = typeof errObj?.status === 'number' ? errObj.status : 0;
 
   // Rate limiting / Too many requests
@@ -152,9 +169,28 @@ export function getSafeAuthErrorMessage(
     return 'Network connection error. Please check your internet connection and try again.';
   }
 
+  // Provider / Service configuration errors (must NOT be treated as user input format error)
+  if (
+    message.includes('provider is not enabled') ||
+    message.includes('provider disabled') ||
+    message.includes('unsupported phone provider') ||
+    message.includes('sms provider') ||
+    message.includes('not configured') ||
+    message.includes('signups not allowed')
+  ) {
+    return 'Unable to send verification code. Please try again.';
+  }
+
   // Context-specific messages
   if (context === 'phone_entry') {
-    if (message.includes('invalid') || message.includes('phone') || message.includes('format')) {
+    if (
+      (message.includes('invalid') && message.includes('phone')) ||
+      message.includes('invalid phone') ||
+      message.includes('phone format') ||
+      message.includes('invalid format') ||
+      message.includes('format is invalid') ||
+      message.includes('phone number is invalid')
+    ) {
       return 'Please enter a valid phone number.';
     }
     return 'Unable to send verification code. Please try again.';

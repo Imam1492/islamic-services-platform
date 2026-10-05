@@ -17,16 +17,18 @@ export interface GeneralUserOnboardingScreenProps {
   onSubmit: (fullName: string) => Promise<{ success: boolean; error: any }>;
   isSubmitting: boolean;
   externalError?: string | null;
+  initialFullName?: string;
 }
 
 export function GeneralUserOnboardingScreen({
   onSubmit,
   isSubmitting,
   externalError,
+  initialFullName = '',
 }: GeneralUserOnboardingScreenProps) {
   const { signOut } = useAuth();
 
-  const [fullName, setFullName] = useState<string>('');
+  const [fullName, setFullName] = useState<string>(initialFullName);
   const [adultAcknowledged, setAdultAcknowledged] = useState<boolean>(false);
   const [tosAccepted, setTosAccepted] = useState<boolean>(false);
   const [privacyAccepted, setPrivacyAccepted] = useState<boolean>(false);

@@ -1,9 +1,31 @@
 import React from 'react';
 import { render, act, renderHook } from '@testing-library/react-native';
 import { Text } from 'react-native';
+import * as WebBrowser from 'expo-web-browser';
+import * as Linking from 'expo-linking';
 import { AuthProvider, useAuth } from '../src/context/AuthContext';
 import { supabase } from '../src/lib/supabase';
 import type { Session } from '@supabase/supabase-js';
+
+// Mock WebBrowser and Linking
+jest.mock('expo-web-browser', () => ({
+  maybeCompleteAuthSession: jest.fn(),
+  openAuthSessionAsync: jest.fn(),
+}));
+
+jest.mock('expo-linking', () => ({
+  createURL: jest.fn((path: string) => `islamicservices://${path}`),
+  parse: jest.fn((url: string) => {
+    if (url.includes('code=')) {
+      const match = url.match(/code=([^&]+)/);
+      return { queryParams: { code: match ? match[1] : undefined } };
+    }
+    if (url.includes('error=')) {
+      return { queryParams: { error: 'access_denied', error_description: 'User denied access' } };
+    }
+    return { queryParams: {} };
+  }),
+}));
 
 // Mock Supabase client
 jest.mock('../src/lib/supabase', () => {
@@ -12,8 +34,8 @@ jest.mock('../src/lib/supabase', () => {
       auth: {
         getSession: jest.fn(),
         onAuthStateChange: jest.fn(),
-        signInWithOtp: jest.fn(),
-        verifyOtp: jest.fn(),
+        signInWithOAuth: jest.fn(),
+        exchangeCodeForSession: jest.fn(),
         signOut: jest.fn(),
         refreshSession: jest.fn(),
         startAutoRefresh: jest.fn(),
@@ -23,7 +45,7 @@ jest.mock('../src/lib/supabase', () => {
   };
 });
 
-describe('Mobile AuthContext', () => {
+describe('Mobile AuthContext — Google OAuth V1', () => {
   let mockUnsubscribe: jest.Mock;
   let authStateCallback: ((event: string, session: Session | null) => void) | null = null;
 
@@ -46,10 +68,10 @@ describe('Mobile AuthContext', () => {
     );
   });
 
-  it('initializes with loading state and resolves initial session', async () => {
+  it('session restoration: initializes with loading state and resolves initial session', async () => {
     const mockSession = {
       access_token: 'valid-token',
-      user: { id: 'user-123', phone: '+15551234567' },
+      user: { id: 'user-123', email: 'test@example.com' },
     } as unknown as Session;
 
     (supabase.auth.getSession as jest.Mock).mockResolvedValueOnce({
@@ -74,9 +96,7 @@ describe('Mobile AuthContext', () => {
 
     expect(getByTestId('state').props.children).toBe('loading');
 
-    await act(async () => {
-      // allow getSession promise to resolve
-    });
+    await act(async () => {});
 
     expect(getByTestId('state').props.children).toBe('ready:user-123:valid-token');
   });
@@ -99,7 +119,7 @@ describe('Mobile AuthContext', () => {
 
     const newSession = {
       access_token: 'new-token',
-      user: { id: 'user-456' },
+      user: { id: 'user-456', email: 'oauth@example.com' },
     } as unknown as Session;
 
     await act(async () => {
@@ -110,12 +130,21 @@ describe('Mobile AuthContext', () => {
     expect(mockUnsubscribe).toHaveBeenCalledTimes(1);
   });
 
-  it('invokes signInWithOtp and returns result', async () => {
+  it('Google OAuth initiation: generates correct redirect URI and initiates OAuth with Supabase', async () => {
     (supabase.auth.getSession as jest.Mock).mockResolvedValueOnce({
       data: { session: null },
       error: null,
     });
-    (supabase.auth.signInWithOtp as jest.Mock).mockResolvedValueOnce({
+    (supabase.auth.signInWithOAuth as jest.Mock).mockResolvedValueOnce({
+      data: { url: 'https://accounts.google.com/o/oauth2/auth?client_id=xyz' },
+      error: null,
+    });
+    (WebBrowser.openAuthSessionAsync as jest.Mock).mockResolvedValueOnce({
+      type: 'success',
+      url: 'islamicservices://auth/callback?code=mock_auth_code_123',
+    });
+    (supabase.auth.exchangeCodeForSession as jest.Mock).mockResolvedValueOnce({
+      data: { session: { access_token: 'jwt' }, user: { id: 'usr-1' } },
       error: null,
     });
 
@@ -126,30 +155,41 @@ describe('Mobile AuthContext', () => {
 
     await act(async () => {});
 
-    let res: { error: unknown };
+    let res: { error: Error | null; isCancelled?: boolean };
     await act(async () => {
-      res = await result.current.signInWithOtp({ phone: '+15559876543' });
+      res = await result.current.signInWithGoogle();
     });
 
-    expect(supabase.auth.signInWithOtp).toHaveBeenCalledWith({
-      phone: '+15559876543',
+    expect(Linking.createURL).toHaveBeenCalledWith('auth/callback', {
+      scheme: 'islamicservices',
     });
+    expect(supabase.auth.signInWithOAuth).toHaveBeenCalledWith({
+      provider: 'google',
+      options: {
+        redirectTo: 'islamicservices://auth/callback',
+        skipBrowserRedirect: true,
+      },
+    });
+    expect(WebBrowser.openAuthSessionAsync).toHaveBeenCalledWith(
+      'https://accounts.google.com/o/oauth2/auth?client_id=xyz',
+      'islamicservices://auth/callback'
+    );
+    expect(supabase.auth.exchangeCodeForSession).toHaveBeenCalledWith('mock_auth_code_123');
     expect(res!.error).toBeNull();
+    expect(res!.isCancelled).toBe(false);
   });
 
-  it('invokes verifyOtp with type sms and returns session', async () => {
+  it('handles user cancellation cleanly without error', async () => {
     (supabase.auth.getSession as jest.Mock).mockResolvedValueOnce({
       data: { session: null },
       error: null,
     });
-    const verifiedSession = {
-      access_token: 'sms-verified-token',
-      user: { id: 'user-789', phone: '+15550001111' },
-    } as unknown as Session;
-
-    (supabase.auth.verifyOtp as jest.Mock).mockResolvedValueOnce({
-      data: { session: verifiedSession, user: verifiedSession.user },
+    (supabase.auth.signInWithOAuth as jest.Mock).mockResolvedValueOnce({
+      data: { url: 'https://accounts.google.com/o/oauth2/auth' },
       error: null,
+    });
+    (WebBrowser.openAuthSessionAsync as jest.Mock).mockResolvedValueOnce({
+      type: 'cancel',
     });
 
     const wrapper = ({ children }: { children: React.ReactNode }) => (
@@ -159,18 +199,75 @@ describe('Mobile AuthContext', () => {
 
     await act(async () => {});
 
-    let res: { session: Session | null; user: unknown; error: unknown };
+    let res: { error: Error | null; isCancelled?: boolean };
     await act(async () => {
-      res = await result.current.verifyOtp({ phone: '+15550001111', token: '123456' });
+      res = await result.current.signInWithGoogle();
     });
 
-    expect(supabase.auth.verifyOtp).toHaveBeenCalledWith({
-      phone: '+15550001111',
-      token: '123456',
-      type: 'sms',
-    });
-    expect(res!.session).toBe(verifiedSession);
     expect(res!.error).toBeNull();
+    expect(res!.isCancelled).toBe(true);
+    expect(supabase.auth.exchangeCodeForSession).not.toHaveBeenCalled();
+  });
+
+  it('handles provider failure during signInWithOAuth initiation', async () => {
+    (supabase.auth.getSession as jest.Mock).mockResolvedValueOnce({
+      data: { session: null },
+      error: null,
+    });
+    (supabase.auth.signInWithOAuth as jest.Mock).mockResolvedValueOnce({
+      data: null,
+      error: new Error('Provider not configured'),
+    });
+
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <AuthProvider>{children}</AuthProvider>
+    );
+    const { result } = renderHook(() => useAuth(), { wrapper });
+
+    await act(async () => {});
+
+    let res: { error: Error | null; isCancelled?: boolean };
+    await act(async () => {
+      res = await result.current.signInWithGoogle();
+    });
+
+    expect(res!.error).toBeDefined();
+    expect(res!.error?.message).toContain('Provider not configured');
+    expect(WebBrowser.openAuthSessionAsync).not.toHaveBeenCalled();
+  });
+
+  it('handles PKCE exchange failure safely', async () => {
+    (supabase.auth.getSession as jest.Mock).mockResolvedValueOnce({
+      data: { session: null },
+      error: null,
+    });
+    (supabase.auth.signInWithOAuth as jest.Mock).mockResolvedValueOnce({
+      data: { url: 'https://accounts.google.com/o/oauth2/auth' },
+      error: null,
+    });
+    (WebBrowser.openAuthSessionAsync as jest.Mock).mockResolvedValueOnce({
+      type: 'success',
+      url: 'islamicservices://auth/callback?code=bad_code',
+    });
+    (supabase.auth.exchangeCodeForSession as jest.Mock).mockResolvedValueOnce({
+      data: { session: null, user: null },
+      error: new Error('Invalid authorization code'),
+    });
+
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <AuthProvider>{children}</AuthProvider>
+    );
+    const { result } = renderHook(() => useAuth(), { wrapper });
+
+    await act(async () => {});
+
+    let res: { error: Error | null; isCancelled?: boolean };
+    await act(async () => {
+      res = await result.current.signInWithGoogle();
+    });
+
+    expect(res!.error).toBeDefined();
+    expect(res!.error?.message).toContain('Invalid authorization code');
   });
 
   it('invokes signOut cleanly', async () => {

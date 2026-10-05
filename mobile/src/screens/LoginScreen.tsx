@@ -5,111 +5,73 @@ import {
   View,
   Pressable,
   ActivityIndicator,
-  KeyboardAvoidingView,
-  Platform,
   ScrollView,
 } from 'react-native';
 import { useAuth } from '../context/AuthContext';
-import { PhoneInput } from '../components/PhoneInput';
-import {
-  DEFAULT_COUNTRY_CODE,
-  validatePhoneInput,
-  getSafeAuthErrorMessage,
-} from '../utils/phone';
+import { classifyOAuthError } from '../utils/authErrors';
 
 export interface LoginScreenProps {
-  onOtpSent: (canonicalPhone: string) => void;
-  initialPhone?: string;
+  onSignInSuccess?: () => void;
 }
 
-export function LoginScreen({ onOtpSent }: LoginScreenProps) {
-  const { signInWithOtp } = useAuth();
-
-  const [countryCode, setCountryCode] = useState<string>(DEFAULT_COUNTRY_CODE);
-  const [nationalNumber, setNationalNumber] = useState<string>('');
-  const [validationError, setValidationError] = useState<string | null>(null);
+export function LoginScreen({ onSignInSuccess }: LoginScreenProps) {
+  const { signInWithGoogle } = useAuth();
   const [authError, setAuthError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 
-  const handlePhoneChange = (text: string) => {
-    setNationalNumber(text);
-    if (validationError) setValidationError(null);
-    if (authError) setAuthError(null);
-  };
-
-  const handleCountryCodeChange = (code: string) => {
-    setCountryCode(code);
-    if (validationError) setValidationError(null);
-    if (authError) setAuthError(null);
-  };
-
-  const handleSubmit = useCallback(async () => {
-    // Guard against duplicate/concurrent submission
+  const handleGoogleSignIn = useCallback(async () => {
+    // Guard against duplicate / concurrent submission
     if (isSubmitting) return;
 
-    setValidationError(null);
     setAuthError(null);
-
-    // 1. Client-side UX validation
-    const validation = validatePhoneInput(countryCode, nationalNumber);
-    if (!validation.isValid) {
-      setValidationError(validation.error || 'Please enter a valid phone number.');
-      return;
-    }
-
     setIsSubmitting(true);
 
     try {
-      // 2. Call authoritative existing AuthContext method with canonical E.164 phone
-      const { error } = await signInWithOtp({ phone: validation.e164 });
+      const result = await signInWithGoogle();
 
-      if (error) {
-        // Map error to safe user-facing message; never expose raw backend/system details or PII
-        const safeMessage = getSafeAuthErrorMessage(error, 'phone_entry');
-        setAuthError(safeMessage);
+      if (result.isCancelled) {
+        // User dismissed browser session; no error message
+        setIsSubmitting(false);
         return;
       }
 
-      // 3. On success, proceed to OTP verification screen with the canonical phone value
-      onOtpSent(validation.e164);
+      if (result.error) {
+        const classified = classifyOAuthError(result.error);
+        if (!classified.isCancelled && classified.message) {
+          setAuthError(classified.message);
+        }
+        return;
+      }
+
+      onSignInSuccess?.();
     } catch (unexpectedError) {
-      // Safe generic message on unexpected network/runtime failure
-      const safeMessage = getSafeAuthErrorMessage(unexpectedError, 'phone_entry');
-      setAuthError(safeMessage);
+      const classified = classifyOAuthError(unexpectedError);
+      setAuthError(classified.message || 'Unable to sign in with Google. Please try again.');
     } finally {
       setIsSubmitting(false);
     }
-  }, [isSubmitting, countryCode, nationalNumber, signInWithOtp, onOtpSent]);
+  }, [isSubmitting, signInWithGoogle, onSignInSuccess]);
 
   return (
-    <KeyboardAvoidingView
-      style={styles.container}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-    >
+    <View style={styles.container}>
       <ScrollView
         contentContainerStyle={styles.scrollContent}
         keyboardShouldPersistTaps="handled"
+        testID="login-screen-scroll"
       >
         <View style={styles.header}>
-          <Text style={styles.title}>Sign In / Register</Text>
+          <Text style={styles.badge}>COMMUNITY PORTAL</Text>
+          <Text style={styles.title} testID="login-title">
+            Sign In / Register
+          </Text>
           <Text style={styles.subtitle}>
-            Enter your mobile phone number. We will send you a 6-digit verification code.
+            Welcome to the Islamic Services Platform. Sign in securely with your Google
+            account to discover trusted community services, submit requests, and connect
+            with verified providers.
           </Text>
         </View>
 
-        <View style={styles.form}>
-          <PhoneInput
-            countryCode={countryCode}
-            onCountryCodeChange={handleCountryCodeChange}
-            value={nationalNumber}
-            onChangeText={handlePhoneChange}
-            error={validationError}
-            disabled={isSubmitting}
-            loading={isSubmitting}
-            onSubmitEditing={handleSubmit}
-            testID="login-phone-input"
-          />
-
+        <View style={styles.formCard}>
           {authError ? (
             <View
               style={styles.errorBanner}
@@ -123,20 +85,16 @@ export function LoginScreen({ onOtpSent }: LoginScreenProps) {
 
           <Pressable
             style={({ pressed }) => [
-              styles.submitButton,
-              isSubmitting ? styles.submitButtonDisabled : null,
-              pressed ? styles.submitButtonPressed : null,
+              styles.googleButton,
+              isSubmitting ? styles.googleButtonDisabled : null,
+              pressed ? styles.googleButtonPressed : null,
             ]}
-            onPress={handleSubmit}
+            onPress={handleGoogleSignIn}
             disabled={isSubmitting}
             accessibilityRole="button"
-            accessibilityLabel={
-              isSubmitting
-                ? 'Sending verification code, please wait'
-                : 'Send verification code'
-            }
-            accessibilityState={{ disabled: isSubmitting }}
-            testID="login-submit-button"
+            accessibilityLabel="Continue with Google"
+            accessibilityHint="Opens Google Sign-In in a secure browser window"
+            testID="login-google-button"
           >
             {isSubmitting ? (
               <ActivityIndicator
@@ -145,82 +103,163 @@ export function LoginScreen({ onOtpSent }: LoginScreenProps) {
                 testID="login-loading-indicator"
               />
             ) : (
-              <Text style={styles.submitButtonText}>Send Code</Text>
+              <View style={styles.buttonContent}>
+                <View style={styles.googleIconWrapper}>
+                  <Text style={styles.googleIconText}>G</Text>
+                </View>
+                <Text style={styles.googleButtonText}>Continue with Google</Text>
+              </View>
             )}
           </Pressable>
+
+          <View style={styles.infoBox}>
+            <Text style={styles.infoText}>
+              🔒 Secure authentication provided via Google OAuth.
+              Your email and profile are synchronized authoritatively.
+            </Text>
+          </View>
+        </View>
+
+        <View style={styles.footer}>
+          <Text style={styles.footerText}>
+            By continuing, you acknowledge that onboarding agreements (Terms of Service
+            and Privacy Policy) will be reviewed upon first sign-in.
+          </Text>
         </View>
       </ScrollView>
-    </KeyboardAvoidingView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#F9FAFB',
+    backgroundColor: '#F8FAFC',
   },
   scrollContent: {
     flexGrow: 1,
-    justifyContent: 'center',
     paddingHorizontal: 24,
-    paddingVertical: 32,
+    paddingTop: 48,
+    paddingBottom: 32,
+    justifyContent: 'center',
   },
   header: {
     marginBottom: 32,
+    alignItems: 'center',
+  },
+  badge: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#0F766E',
+    backgroundColor: '#CCFBF1',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+    letterSpacing: 0.8,
+    marginBottom: 16,
+    overflow: 'hidden',
   },
   title: {
     fontSize: 26,
     fontWeight: '700',
-    color: '#111827',
-    marginBottom: 8,
+    color: '#0F172A',
+    textAlign: 'center',
+    marginBottom: 12,
   },
   subtitle: {
     fontSize: 15,
-    color: '#4B5563',
+    color: '#475569',
+    textAlign: 'center',
     lineHeight: 22,
+    paddingHorizontal: 8,
   },
-  form: {
+  formCard: {
     backgroundColor: '#FFFFFF',
-    padding: 24,
     borderRadius: 16,
-    borderWidth: 1,
-    borderColor: '#E5E7EB',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.05,
-    shadowRadius: 8,
+    padding: 24,
+    shadowColor: '#0F172A',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.06,
+    shadowRadius: 12,
     elevation: 2,
+    marginBottom: 24,
+  },
+  googleButton: {
+    backgroundColor: '#2563EB',
+    borderRadius: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 52,
+  },
+  googleButtonPressed: {
+    backgroundColor: '#1D4ED8',
+    transform: [{ scale: 0.99 }],
+  },
+  googleButtonDisabled: {
+    backgroundColor: '#93C5FD',
+  },
+  buttonContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  googleIconWrapper: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    backgroundColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+  },
+  googleIconText: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: '#2563EB',
+  },
+  googleButtonText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#FFFFFF',
+    letterSpacing: 0.2,
   },
   errorBanner: {
     backgroundColor: '#FEF2F2',
-    borderWidth: 1,
     borderColor: '#FCA5A5',
-    borderRadius: 8,
-    padding: 12,
-    marginBottom: 16,
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    marginBottom: 18,
   },
   errorBannerText: {
+    color: '#991B1B',
     fontSize: 14,
-    color: '#B91C1C',
+    fontWeight: '500',
     lineHeight: 20,
   },
-  submitButton: {
-    backgroundColor: '#2563EB',
-    height: 50,
-    borderRadius: 10,
-    justifyContent: 'center',
+  infoBox: {
+    marginTop: 20,
+    paddingTop: 16,
+    borderTopWidth: 1,
+    borderTopColor: '#F1F5F9',
+  },
+  infoText: {
+    fontSize: 13,
+    color: '#64748B',
+    textAlign: 'center',
+    lineHeight: 18,
+  },
+  footer: {
     alignItems: 'center',
-    marginTop: 8,
+    paddingHorizontal: 16,
   },
-  submitButtonDisabled: {
-    backgroundColor: '#93C5FD',
-  },
-  submitButtonPressed: {
-    backgroundColor: '#1D4ED8',
-  },
-  submitButtonText: {
-    color: '#FFFFFF',
-    fontSize: 16,
-    fontWeight: '600',
+  footerText: {
+    fontSize: 12,
+    color: '#94A3B8',
+    textAlign: 'center',
+    lineHeight: 18,
   },
 });

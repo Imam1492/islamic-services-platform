@@ -7,26 +7,20 @@ import React, {
   useMemo,
 } from 'react';
 import type { Session, User, AuthError } from '@supabase/supabase-js';
+import * as WebBrowser from 'expo-web-browser';
+import * as Linking from 'expo-linking';
 import { supabase } from '../lib/supabase';
 
-export interface SignInWithOtpParams {
-  phone: string;
-}
-
-export interface VerifyOtpParams {
-  phone: string;
-  token: string;
-}
+// Ensure browser session completes properly on Android and web
+WebBrowser.maybeCompleteAuthSession();
 
 export interface AuthContextValue {
   session: Session | null;
   user: User | null;
   loading: boolean;
-  signInWithOtp: (params: SignInWithOtpParams) => Promise<{ error: AuthError | null }>;
-  verifyOtp: (params: VerifyOtpParams) => Promise<{
-    session: Session | null;
-    user: User | null;
-    error: AuthError | null;
+  signInWithGoogle: () => Promise<{
+    error: Error | AuthError | null;
+    isCancelled?: boolean;
   }>;
   signOut: () => Promise<{ error: AuthError | null }>;
   refreshSession: () => Promise<{
@@ -84,20 +78,72 @@ export function AuthProvider({ children }: AuthProviderProps) {
     };
   }, []);
 
-  const signInWithOtp = useCallback(async ({ phone }: SignInWithOtpParams) => {
-    const { error } = await supabase.auth.signInWithOtp({
-      phone,
-    });
-    return { error };
-  }, []);
+  const signInWithGoogle = useCallback(async (): Promise<{
+    error: Error | AuthError | null;
+    isCancelled?: boolean;
+  }> => {
+    try {
+      const redirectUrl = Linking.createURL('auth/callback', {
+        scheme: 'islamicservices',
+      });
 
-  const verifyOtp = useCallback(async ({ phone, token }: VerifyOtpParams) => {
-    const { data, error } = await supabase.auth.verifyOtp({
-      phone,
-      token,
-      type: 'sms',
-    });
-    return { session: data.session, user: data.user, error };
+      const { data, error } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: redirectUrl,
+          skipBrowserRedirect: true,
+        },
+      });
+
+      if (error) {
+        return { error, isCancelled: false };
+      }
+
+      if (!data?.url) {
+        return {
+          error: new Error('Failed to obtain Google authentication URL'),
+          isCancelled: false,
+        };
+      }
+
+      const browserResult = await WebBrowser.openAuthSessionAsync(
+        data.url,
+        redirectUrl
+      );
+
+      if (browserResult.type === 'cancel' || browserResult.type === 'dismiss') {
+        return { error: null, isCancelled: true };
+      }
+
+      if (browserResult.type === 'success' && browserResult.url) {
+        const parsed = Linking.parse(browserResult.url);
+        const code = parsed.queryParams?.code;
+
+        if (typeof code === 'string' && code.length > 0) {
+          const { error: exchangeError } =
+            await supabase.auth.exchangeCodeForSession(code);
+          if (exchangeError) {
+            return { error: exchangeError, isCancelled: false };
+          }
+          return { error: null, isCancelled: false };
+        }
+
+        const queryError = parsed.queryParams?.error_description || parsed.queryParams?.error;
+        if (queryError) {
+          return {
+            error: new Error(String(queryError)),
+            isCancelled: false,
+          };
+        }
+      }
+
+      return { error: null, isCancelled: false };
+    } catch (err: any) {
+      return {
+        error: err instanceof Error ? err : new Error('Unexpected authentication error'),
+        isCancelled: false,
+      };
+    }
   }, []);
 
   const signOut = useCallback(async () => {
@@ -117,12 +163,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
       session,
       user,
       loading,
-      signInWithOtp,
-      verifyOtp,
+      signInWithGoogle,
       signOut,
       refreshSession,
     }),
-    [session, user, loading, signInWithOtp, verifyOtp, signOut, refreshSession]
+    [session, user, loading, signInWithGoogle, signOut, refreshSession]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

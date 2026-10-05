@@ -65,6 +65,17 @@ export function AccountShellScreen({ onboardedAt }: AccountShellScreenProps) {
         <View style={styles.sectionCard} testID="account-details-card">
           <Text style={styles.sectionHeader}>Account Information</Text>
 
+          {/* Primary Email Address */}
+          <View style={styles.detailRow}>
+            <Text style={styles.detailLabel}>Email</Text>
+            <Text style={styles.detailValue} testID="account-email">
+              {user?.email || 'No email provided'}
+            </Text>
+            <Text style={styles.privacyNote}>Primary authentication credential</Text>
+          </View>
+
+          <View style={styles.divider} />
+
           {/* Masked Phone Number */}
           <View style={styles.detailRow}>
             <Text style={styles.detailLabel}>Mobile Phone</Text>

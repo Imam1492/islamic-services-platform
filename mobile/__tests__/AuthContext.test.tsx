@@ -13,18 +13,42 @@ jest.mock('expo-web-browser', () => ({
   openAuthSessionAsync: jest.fn(),
 }));
 
+let mockUrlListener: ((event: { url: string }) => void) | null = null;
+const mockLinkingRemove = jest.fn();
+
 jest.mock('expo-linking', () => ({
   createURL: jest.fn((path: string) => `islamicservices://${path}`),
   parse: jest.fn((url: string) => {
+    if (!url) return { queryParams: {} };
     if (url.includes('code=')) {
       const match = url.match(/code=([^&]+)/);
-      return { queryParams: { code: match ? match[1] : undefined } };
+      return {
+        hostname: 'auth',
+        path: 'callback',
+        queryParams: { code: match ? match[1] : undefined },
+      };
     }
     if (url.includes('error=')) {
-      return { queryParams: { error: 'access_denied', error_description: 'User denied access' } };
+      return {
+        hostname: 'auth',
+        path: 'callback',
+        queryParams: {
+          error: 'access_denied',
+          error_description: 'User denied access',
+        },
+      };
     }
-    return { queryParams: {} };
+    return { hostname: 'auth', path: 'callback', queryParams: {} };
   }),
+  addEventListener: jest.fn((event: string, cb: (event: { url: string }) => void) => {
+    if (event === 'url') {
+      mockUrlListener = cb;
+    }
+    return {
+      remove: mockLinkingRemove,
+    };
+  }),
+  getInitialURL: jest.fn().mockResolvedValue(null),
 }));
 
 // Mock Supabase client
@@ -53,6 +77,8 @@ describe('Mobile AuthContext — Google OAuth V1', () => {
     jest.clearAllMocks();
     mockUnsubscribe = jest.fn();
     authStateCallback = null;
+    mockUrlListener = null;
+    (Linking.getInitialURL as jest.Mock).mockResolvedValue(null);
 
     (supabase.auth.onAuthStateChange as jest.Mock).mockImplementation(
       (cb: (event: string, session: Session | null) => void) => {
@@ -128,6 +154,7 @@ describe('Mobile AuthContext — Google OAuth V1', () => {
 
     unmount();
     expect(mockUnsubscribe).toHaveBeenCalledTimes(1);
+    expect(mockLinkingRemove).toHaveBeenCalled();
   });
 
   it('Google OAuth initiation: generates correct redirect URI and initiates OAuth with Supabase', async () => {
@@ -179,7 +206,50 @@ describe('Mobile AuthContext — Google OAuth V1', () => {
     expect(res!.isCancelled).toBe(false);
   });
 
-  it('handles user cancellation cleanly without error', async () => {
+  it('Android race condition fix: handles browserResult.type === "dismiss" followed by Linking callback URL', async () => {
+    (supabase.auth.getSession as jest.Mock).mockResolvedValueOnce({
+      data: { session: null },
+      error: null,
+    });
+    (supabase.auth.signInWithOAuth as jest.Mock).mockResolvedValueOnce({
+      data: { url: 'https://accounts.google.com/o/oauth2/auth' },
+      error: null,
+    });
+
+    // Simulate Android Chrome Custom Tab premature dismiss
+    (WebBrowser.openAuthSessionAsync as jest.Mock).mockImplementationOnce(async () => {
+      // Simulate intent arrival via Linking slightly after or during dismiss
+      setTimeout(() => {
+        if (mockUrlListener) {
+          mockUrlListener({ url: 'islamicservices://auth/callback?code=android_code_789' });
+        }
+      }, 10);
+      return { type: 'dismiss' };
+    });
+
+    (supabase.auth.exchangeCodeForSession as jest.Mock).mockResolvedValueOnce({
+      data: { session: { access_token: 'token-789' }, user: { id: 'usr-789' } },
+      error: null,
+    });
+
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <AuthProvider>{children}</AuthProvider>
+    );
+    const { result } = renderHook(() => useAuth(), { wrapper });
+
+    await act(async () => {});
+
+    let res: { error: Error | null; isCancelled?: boolean };
+    await act(async () => {
+      res = await result.current.signInWithGoogle();
+    });
+
+    expect(supabase.auth.exchangeCodeForSession).toHaveBeenCalledWith('android_code_789');
+    expect(res!.error).toBeNull();
+    expect(res!.isCancelled).toBe(false);
+  });
+
+  it('handles genuine user cancellation cleanly without error when no callback is delivered', async () => {
     (supabase.auth.getSession as jest.Mock).mockResolvedValueOnce({
       data: { session: null },
       error: null,
@@ -268,6 +338,124 @@ describe('Mobile AuthContext — Google OAuth V1', () => {
 
     expect(res!.error).toBeDefined();
     expect(res!.error?.message).toContain('Invalid authorization code');
+    expect(res!.isCancelled).toBe(false);
+  });
+
+  it('cold-start callback: exchanges authorization code from getInitialURL on startup', async () => {
+    (supabase.auth.getSession as jest.Mock).mockResolvedValueOnce({
+      data: { session: null },
+      error: null,
+    });
+    (Linking.getInitialURL as jest.Mock).mockResolvedValueOnce(
+      'islamicservices://auth/callback?code=cold_start_code_999'
+    );
+    (supabase.auth.exchangeCodeForSession as jest.Mock).mockResolvedValueOnce({
+      data: { session: { access_token: 'cold-jwt' }, user: { id: 'cold-usr' } },
+      error: null,
+    });
+
+    render(
+      <AuthProvider>
+        <Text>Cold Start Test</Text>
+      </AuthProvider>
+    );
+
+    await act(async () => {});
+
+    expect(supabase.auth.exchangeCodeForSession).toHaveBeenCalledWith('cold_start_code_999');
+  });
+
+  it('deduplication: exchanges the same authorization code exactly once even if duplicate events fire', async () => {
+    (supabase.auth.getSession as jest.Mock).mockResolvedValueOnce({
+      data: { session: null },
+      error: null,
+    });
+    (supabase.auth.exchangeCodeForSession as jest.Mock).mockResolvedValue({
+      data: { session: { access_token: 'dup-jwt' }, user: { id: 'dup-usr' } },
+      error: null,
+    });
+
+    render(
+      <AuthProvider>
+        <Text>Deduplication Test</Text>
+      </AuthProvider>
+    );
+
+    await act(async () => {});
+
+    // Fire duplicate deep-link events
+    await act(async () => {
+      mockUrlListener!({ url: 'islamicservices://auth/callback?code=duplicate_code_555' });
+    });
+    await act(async () => {
+      mockUrlListener!({ url: 'islamicservices://auth/callback?code=duplicate_code_555' });
+    });
+
+    expect(supabase.auth.exchangeCodeForSession).toHaveBeenCalledTimes(1);
+    expect(supabase.auth.exchangeCodeForSession).toHaveBeenCalledWith('duplicate_code_555');
+  });
+
+  it('malformed callback: safely ignores irrelevant routes or URLs without code', async () => {
+    (supabase.auth.getSession as jest.Mock).mockResolvedValueOnce({
+      data: { session: null },
+      error: null,
+    });
+
+    render(
+      <AuthProvider>
+        <Text>Malformed Callback Test</Text>
+      </AuthProvider>
+    );
+
+    await act(async () => {});
+
+    // Irrelevant route
+    await act(async () => {
+      mockUrlListener!({ url: 'islamicservices://other/path?id=123' });
+    });
+    // Callback without code parameter
+    await act(async () => {
+      mockUrlListener!({ url: 'islamicservices://auth/callback' });
+    });
+
+    expect(supabase.auth.exchangeCodeForSession).not.toHaveBeenCalled();
+  });
+
+  it('error callback: reports OAuth error without exposing secrets', async () => {
+    (supabase.auth.getSession as jest.Mock).mockResolvedValueOnce({
+      data: { session: null },
+      error: null,
+    });
+    (supabase.auth.signInWithOAuth as jest.Mock).mockResolvedValueOnce({
+      data: { url: 'https://accounts.google.com/o/oauth2/auth' },
+      error: null,
+    });
+    (WebBrowser.openAuthSessionAsync as jest.Mock).mockImplementationOnce(async () => {
+      setTimeout(() => {
+        if (mockUrlListener) {
+          mockUrlListener({
+            url: 'islamicservices://auth/callback?error=access_denied&error_description=User%20denied%20access',
+          });
+        }
+      }, 10);
+      return { type: 'dismiss' };
+    });
+
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <AuthProvider>{children}</AuthProvider>
+    );
+    const { result } = renderHook(() => useAuth(), { wrapper });
+
+    await act(async () => {});
+
+    let res: { error: Error | null; isCancelled?: boolean };
+    await act(async () => {
+      res = await result.current.signInWithGoogle();
+    });
+
+    expect(res!.error).toBeDefined();
+    expect(res!.error?.message).toContain('User denied access');
+    expect(res!.isCancelled).toBe(false);
   });
 
   it('invokes signOut cleanly', async () => {
@@ -301,3 +489,4 @@ describe('Mobile AuthContext — Google OAuth V1', () => {
     }).toThrow('useAuth must be used within an AuthProvider');
   });
 });
+

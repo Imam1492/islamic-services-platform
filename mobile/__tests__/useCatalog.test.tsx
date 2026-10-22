@@ -3,6 +3,14 @@ import { useCatalog } from '../src/hooks/useCatalog';
 import { CatalogService } from '../src/services/catalogService';
 import type { CatalogData, ResolvedArea, CatalogService as ICatalogService } from '../src/types/catalog';
 
+jest.mock('../src/lib/secureStorage', () => ({
+  LargeSecureStoreAdapter: {
+    getItem: jest.fn().mockResolvedValue(null),
+    setItem: jest.fn().mockResolvedValue(undefined),
+    removeItem: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
 jest.mock('../src/services/catalogService');
 
 describe('useCatalog Hook Suite (Phase 3.4.2B-A)', () => {

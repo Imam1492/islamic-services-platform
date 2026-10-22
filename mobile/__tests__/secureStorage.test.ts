@@ -72,7 +72,7 @@ describe('LargeSecureStoreAdapter', () => {
     expect(retrieved).toBeNull();
   });
 
-  it('returns null if any chunk is missing in a chunked record', async () => {
+  it('throws when a chunk is missing instead of treating corruption as absence', async () => {
     const key = 'corrupt_session';
     const value = 'Y'.repeat(2500);
 
@@ -82,7 +82,18 @@ describe('LargeSecureStoreAdapter', () => {
     const store = (SecureStore as unknown as { __store: Map<string, string> }).__store;
     store.delete(`${key}_chunk_1`);
 
-    const retrieved = await LargeSecureStoreAdapter.getItem(key);
-    expect(retrieved).toBeNull();
+    await expect(LargeSecureStoreAdapter.getItem(key)).rejects.toThrow(
+      'Secure storage contains an incomplete value'
+    );
+  });
+
+  it('propagates SecureStore read failures instead of returning null', async () => {
+    (SecureStore.getItemAsync as jest.Mock).mockRejectedValueOnce(new Error('keychain unavailable'));
+    await expect(LargeSecureStoreAdapter.getItem('read_failure')).rejects.toThrow('keychain unavailable');
+  });
+
+  it('propagates SecureStore removal failures', async () => {
+    (SecureStore.deleteItemAsync as jest.Mock).mockRejectedValueOnce(new Error('delete failed'));
+    await expect(LargeSecureStoreAdapter.removeItem('remove_failure')).rejects.toThrow('delete failed');
   });
 });

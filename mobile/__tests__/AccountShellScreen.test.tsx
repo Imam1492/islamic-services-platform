@@ -18,6 +18,14 @@ let mockCurrentSession: Session | null = {
   },
 } as unknown as Session;
 
+jest.mock('../src/lib/secureStorage', () => ({
+  LargeSecureStoreAdapter: {
+    getItem: jest.fn().mockResolvedValue(null),
+    setItem: jest.fn().mockResolvedValue(undefined),
+    removeItem: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
 jest.mock('../src/lib/supabase', () => ({
   supabase: {
     auth: {
@@ -100,6 +108,16 @@ describe('AccountShellScreen Privacy & Factual Presentation Suite — Google OAu
 
     const maskedPhoneText = getByTestId('account-masked-phone').props.children;
     expect(maskedPhoneText).toBe('Not provided');
+  });
+
+  it('shows a failure when sign-out cannot be confirmed', async () => {
+    (supabase.auth.signOut as jest.Mock).mockResolvedValueOnce({
+      error: { name: 'AuthUnknownError', status: 500 },
+    });
+    const { getByTestId } = await renderScreen();
+
+    fireEvent.press(getByTestId('account-signout-button'));
+    await waitFor(() => expect(getByTestId('account-signout-error')).toBeTruthy());
   });
 
   it('does NOT display raw database UUID in the UI', async () => {

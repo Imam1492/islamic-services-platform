@@ -1,15 +1,13 @@
 /**
  * @jest-environment node
  */
-import { updateSession } from '../lib/supabase/middleware';
+import { proxy, config } from '../proxy';
 import { NextRequest } from 'next/server';
 import { createServerClient } from '@supabase/ssr';
 
-jest.mock('@supabase/ssr', () => ({
-  createServerClient: jest.fn(),
-}));
+jest.mock('@supabase/ssr', () => ({ createServerClient: jest.fn() }));
 
-describe('Admin Authentication Middleware & Route Protection', () => {
+describe('Admin Proxy authentication gate', () => {
   const originalEnv = process.env;
 
   beforeEach(() => {
@@ -25,70 +23,56 @@ describe('Admin Authentication Middleware & Route Protection', () => {
     process.env = originalEnv;
   });
 
-  it('redirects unauthenticated user accessing /dashboard to /login with redirectTo parameter', async () => {
-    (createServerClient as jest.Mock).mockReturnValue({
-      auth: {
-        getUser: jest.fn().mockResolvedValue({
-          data: { user: null },
-          error: new Error('Unauthorized'),
-        }),
-      },
-    });
-
-    const request = new NextRequest('http://localhost:3000/dashboard/overview');
-    const response = await updateSession(request);
-
-    expect(response.status).toBe(307); // NextResponse.redirect default
-    const location = response.headers.get('location');
-    expect(location).toContain('/login?redirectTo=%2Fdashboard%2Foverview');
+  it('uses the Next.js 16 Proxy convention for dashboard paths', () => {
+    expect(config.matcher).toEqual(['/dashboard/:path*']);
   });
 
-  it('allows authenticated user to access /dashboard', async () => {
+  it('redirects anonymous and expired sessions to login', async () => {
     (createServerClient as jest.Mock).mockReturnValue({
-      auth: {
-        getUser: jest.fn().mockResolvedValue({
-          data: { user: { id: 'admin-user-uuid', email: 'admin@example.com' } },
-          error: null,
-        }),
-      },
+      auth: { getUser: jest.fn().mockResolvedValue({ data: { user: null }, error: new Error('Session expired') }) },
     });
+    const response = await proxy(new NextRequest('http://localhost:3000/dashboard/overview'));
+    expect(response.status).toBe(307);
+    expect(response.headers.get('location')).toContain('/login?redirectTo=%2Fdashboard%2Foverview');
+  });
 
-    const request = new NextRequest('http://localhost:3000/dashboard');
-    const response = await updateSession(request);
-
-    // Passes through without redirect
+  it('passes a verified user through the early gate without checking role there', async () => {
+    const rpc = jest.fn();
+    (createServerClient as jest.Mock).mockReturnValue({
+      auth: { getUser: jest.fn().mockResolvedValue({ data: { user: { id: 'ordinary-user' } }, error: null }) },
+      rpc,
+    });
+    const response = await proxy(new NextRequest('http://localhost:3000/dashboard'));
     expect(response.status).toBe(200);
-    expect(response.headers.get('location')).toBeNull();
+    expect(rpc).not.toHaveBeenCalled();
   });
 
-  it('allows unauthenticated user to access public routes like / or /login without redirect', async () => {
-    (createServerClient as jest.Mock).mockReturnValue({
-      auth: {
-        getUser: jest.fn().mockResolvedValue({
-          data: { user: null },
-          error: null,
-        }),
-      },
-    });
-
-    const requestRoot = new NextRequest('http://localhost:3000/');
-    const responseRoot = await updateSession(requestRoot);
-    expect(responseRoot.status).toBe(200);
-    expect(responseRoot.headers.get('location')).toBeNull();
-
-    const requestLogin = new NextRequest('http://localhost:3000/login');
-    const responseLogin = await updateSession(requestLogin);
-    expect(responseLogin.status).toBe(200);
-    expect(responseLogin.headers.get('location')).toBeNull();
+  it.each([
+    ['URL', 'NEXT_PUBLIC_SUPABASE_URL'],
+    ['anon key', 'NEXT_PUBLIC_SUPABASE_ANON_KEY'],
+  ])('fails closed when the Supabase %s is missing', async (_label, key) => {
+    delete process.env[key];
+    const response = await proxy(new NextRequest('http://localhost:3000/dashboard'));
+    expect(response.status).toBe(503);
+    expect(createServerClient).not.toHaveBeenCalled();
   });
 
-  it('handles missing environment variables safely without crashing', async () => {
+  it('leaves public routes available if Supabase configuration is missing', async () => {
     delete process.env.NEXT_PUBLIC_SUPABASE_URL;
     delete process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+    const response = await proxy(new NextRequest('http://localhost:3000/login'));
+    expect(response.status).toBe(200);
+    expect(createServerClient).not.toHaveBeenCalled();
+  });
 
-    const request = new NextRequest('http://localhost:3000/dashboard');
-    const response = await updateSession(request);
+  it('fails closed if session verification throws', async () => {
+    (createServerClient as jest.Mock).mockImplementation(() => { throw new Error('Auth service unavailable'); });
+    const response = await proxy(new NextRequest('http://localhost:3000/dashboard'));
+    expect(response.status).toBe(503);
+  });
 
+  it('does not treat unrelated dashboard-prefixed paths as protected', async () => {
+    const response = await proxy(new NextRequest('http://localhost:3000/dashboard-preview'));
     expect(response.status).toBe(200);
     expect(createServerClient).not.toHaveBeenCalled();
   });

@@ -6,6 +6,7 @@ import { LegalDocumentService } from '../src/services/legalDocumentService';
 import { CONTROLLED_TOS_VERSION, CONTROLLED_PRIVACY_VERSION } from '../src/constants/legal';
 import * as WebBrowser from 'expo-web-browser';
 import type { Session } from '@supabase/supabase-js';
+import { LargeSecureStoreAdapter } from '../src/lib/secureStorage';
 
 let mockAuthStateListener: ((event: string, session: Session | null) => void) | null = null;
 let mockCurrentSession: Session | null = null;
@@ -40,11 +41,23 @@ jest.mock('../src/lib/supabase', () => ({
         };
       }),
       signInWithOAuth: jest.fn(),
+      signUp: jest.fn(),
+      signInWithPassword: jest.fn(),
+      resetPasswordForEmail: jest.fn(),
+      updateUser: jest.fn(),
       exchangeCodeForSession: jest.fn(),
       signOut: jest.fn(),
       refreshSession: jest.fn(),
     },
     rpc: jest.fn(),
+  },
+}));
+
+jest.mock('../src/lib/secureStorage', () => ({
+  LargeSecureStoreAdapter: {
+    getItem: jest.fn().mockResolvedValue(null),
+    setItem: jest.fn().mockResolvedValue(undefined),
+    removeItem: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -63,6 +76,9 @@ describe('Complete Mobile Authentication Flow & Authoritative Onboarding Gate â€
 
   beforeEach(() => {
     jest.clearAllMocks();
+    (LargeSecureStoreAdapter.getItem as jest.Mock).mockResolvedValue(null);
+    (LargeSecureStoreAdapter.setItem as jest.Mock).mockResolvedValue(undefined);
+    (LargeSecureStoreAdapter.removeItem as jest.Mock).mockResolvedValue(undefined);
     mockCurrentSession = null;
     mockAuthStateListener = null;
   });
@@ -230,5 +246,65 @@ describe('Complete Mobile Authentication Flow & Authoritative Onboarding Gate â€
       expect(getByTestId('authenticated-tab-navigator')).toBeTruthy();
       expect(queryByTestId('onboarding-fullname-input')).toBeNull();
     });
+  });
+
+  it('routes PASSWORD_RECOVERY sessions to the reset-password form', async () => {
+    (supabase.auth.updateUser as jest.Mock).mockResolvedValueOnce({ error: null });
+    (supabase.rpc as jest.Mock).mockResolvedValueOnce({
+      data: { is_onboarded: true, onboarded_at: '2026-10-05T12:00:00Z' },
+      error: null,
+    });
+    const { getByTestId, getByText } = render(<App />);
+    await act(async () => {});
+
+    await act(async () => {
+      mockAuthStateListener!('PASSWORD_RECOVERY', mockSession);
+    });
+    expect(getByText('Choose a new password')).toBeTruthy();
+
+    fireEvent.changeText(getByTestId('auth-password-input'), 'recovered-password-123');
+    fireEvent.changeText(getByTestId('auth-confirm-password-input'), 'recovered-password-123');
+    fireEvent.press(getByTestId('email-auth-submit-button'));
+
+    await waitFor(() => {
+      expect(supabase.auth.updateUser).toHaveBeenCalledWith({ password: 'recovered-password-123' });
+      expect(getByTestId('authenticated-tab-navigator')).toBeTruthy();
+    });
+  });
+
+  it('fails closed after recovery persistence and sign-out fail, including simulated restart', async () => {
+    mockCurrentSession = mockSession;
+    (LargeSecureStoreAdapter.setItem as jest.Mock).mockRejectedValueOnce(new Error('storage unavailable'));
+    (supabase.auth.signOut as jest.Mock).mockResolvedValueOnce({
+      error: { name: 'AuthUnknownError', status: 500 },
+    });
+    const firstRun = render(<App />);
+    await act(async () => {});
+
+    await act(async () => {
+      mockAuthStateListener!('PASSWORD_RECOVERY', mockSession);
+    });
+
+    await waitFor(() => expect(firstRun.getByTestId('clear-local-auth-state-button')).toBeTruthy());
+    expect(firstRun.queryByTestId('authenticated-tab-navigator')).toBeNull();
+    firstRun.unmount();
+
+    // Simulate restart while secure storage remains unavailable. The persisted
+    // session is present, but the marker cannot be confirmed absent.
+    (LargeSecureStoreAdapter.getItem as jest.Mock).mockRejectedValueOnce(
+      new Error('secure storage unavailable after restart')
+    );
+    const restarted = render(<App />);
+    await waitFor(() => expect(restarted.getByText('Secure sign-in unavailable')).toBeTruthy());
+
+    expect(restarted.queryByTestId('authenticated-tab-navigator')).toBeNull();
+    expect(restarted.queryByTestId('login-google-button')).toBeNull();
+    expect(restarted.getByTestId('clear-local-auth-state-button')).toBeTruthy();
+
+    (supabase.auth.signOut as jest.Mock).mockResolvedValueOnce({ error: null });
+    (LargeSecureStoreAdapter.removeItem as jest.Mock).mockResolvedValueOnce(undefined);
+    fireEvent.press(restarted.getByTestId('clear-local-auth-state-button'));
+    await waitFor(() => expect(restarted.getByTestId('login-google-button')).toBeTruthy());
+    expect(restarted.queryByTestId('authenticated-tab-navigator')).toBeNull();
   });
 });

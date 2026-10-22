@@ -1,25 +1,26 @@
 -- Rollback Migration: 20261018000000_11_contact_share_security_hardening_down.sql
--- Description: Reverts Migration 11 back to baseline state (Migrations 01-10):
---   1. Restores table grants (GRANT UPDATE ON public.contact_shares TO authenticated).
+-- Description: Reverts Migration 11 to the pre-11 state, while retaining the
+--   documented service-request notes-only UPDATE contract:
+--   1. Restores table UPDATE on contact_shares and notes-only UPDATE on service_requests.
 --   2. Restores RLS policy p_contact_shares_update_participant from Migration 03.
---   3. Restores GRANT UPDATE (status) ON public.service_requests TO authenticated and check_request_status_update() from Migration 03.
---   4. Restores EXECUTE ON public.log_audit_event to authenticated from Migration 03.
---   5. Restores EXECUTE ON public.assert_provider_covers_area from Migration 04.
+--   3. Restores check_request_status_update() and its pre-Migration-11 grants from Migration 03.
+--   4. Restores EXECUTE grants on public.log_audit_event from Migration 03.
+--   5. Restores EXECUTE grants on public.assert_provider_covers_area from Migration 04.
 --   6. Restores original public.validate_contact_share() from Migration 03.
 --   7. Restores original public.request_contact_share() from Migration 04.
---   8. Restores original privileges on public.respond_contact_share() from Migration 04.
+--   8. Restores original EXECUTE grants on public.respond_contact_share() from Migration 04.
 --   9. Restores original public.transition_service_request() from Migration 04.
 --  10. Restores original public.get_shared_contact_info() from Migration 04.
 --
 -- ============================================================================
 -- DOCUMENTATION OF SECURITY WEAKNESSES RESTORED BY THIS ROLLBACK SCRIPT:
 -- ============================================================================
--- 1. Table UPDATE Exposure: Restores direct UPDATE privileges on public.contact_shares
---    to authenticated clients, bypassing server-side RPC validation and concurrency locks.
+-- 1. Table UPDATE Exposure: Restores direct UPDATE privileges on public.contact_shares.
+--    service_requests remains restricted to notes on the requester's own REQUESTED row.
 -- 2. Audit Trail Tampering: Restores client-side EXECUTE on public.log_audit_event,
 --    enabling authenticated users to inject arbitrary fabricated audit entries.
--- 3. Anonymous Oracle Enumeration: Reverts explicit anon revocation on assert_provider_covers_area
---    and get_shared_contact_info, relying solely on default schema inheritance.
+-- 3. Anonymous Function Access: Restores the anon EXECUTE grants present before
+--    Migration 11 (the earlier migrations revoked PUBLIC but did not revoke anon).
 -- 4. Post-Completion Contact Leakage: Reverts get_shared_contact_info to pre-Migration-11
 --    code which omits COMPLETED from its terminal status check.
 -- 5. Race Condition Exposure: Reverts request_contact_share to pre-Migration-11 code
@@ -47,10 +48,24 @@ CREATE POLICY p_contact_shares_update_participant
 
 
 -- ============================================================================
--- 1b. RESTORE SERVICE_REQUESTS STATUS PRIVILEGES & TRIGGER (FROM MIGRATION 03)
+-- 1b. RESTORE SERVICE_REQUESTS NOTES-ONLY UPDATE CONTRACT
 -- ============================================================================
 
-GRANT UPDATE (status) ON TABLE public.service_requests TO authenticated;
+-- Migration 03 documents requester edits to non-status fields (including
+-- notes). The supported editable field is notes; preserve that contract on
+-- rollback without restoring table-wide UPDATE or writable protected columns.
+REVOKE UPDATE ON TABLE public.service_requests FROM authenticated, anon, PUBLIC;
+REVOKE UPDATE (id, user_id, provider_id, service_id, location_id, status, event_date, notes, created_at, updated_at)
+  ON TABLE public.service_requests FROM authenticated, anon, PUBLIC;
+GRANT UPDATE (notes) ON TABLE public.service_requests TO authenticated;
+
+DROP POLICY IF EXISTS p_service_requests_update_requester ON public.service_requests;
+CREATE POLICY p_service_requests_update_requester
+  ON public.service_requests
+  FOR UPDATE
+  TO authenticated
+  USING (auth.uid() = user_id AND status = 'REQUESTED'::public.request_status)
+  WITH CHECK (auth.uid() = user_id AND status = 'REQUESTED'::public.request_status);
 
 CREATE OR REPLACE FUNCTION public.check_request_status_update()
 RETURNS trigger
@@ -88,7 +103,7 @@ END;
 $$;
 
 REVOKE EXECUTE ON FUNCTION public.check_request_status_update() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.check_request_status_update() TO authenticated, service_role, postgres;
+GRANT EXECUTE ON FUNCTION public.check_request_status_update() TO authenticated, anon, service_role, postgres;
 
 
 -- ============================================================================
@@ -96,7 +111,7 @@ GRANT EXECUTE ON FUNCTION public.check_request_status_update() TO authenticated,
 -- ============================================================================
 
 REVOKE EXECUTE ON FUNCTION public.log_audit_event(uuid, text, text, uuid, jsonb, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.log_audit_event(uuid, text, text, uuid, jsonb, jsonb) TO authenticated, service_role, postgres;
+GRANT EXECUTE ON FUNCTION public.log_audit_event(uuid, text, text, uuid, jsonb, jsonb) TO authenticated, anon, service_role, postgres;
 
 
 -- ============================================================================
@@ -104,7 +119,7 @@ GRANT EXECUTE ON FUNCTION public.log_audit_event(uuid, text, text, uuid, jsonb, 
 -- ============================================================================
 
 REVOKE EXECUTE ON FUNCTION public.assert_provider_covers_area(uuid, uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.assert_provider_covers_area(uuid, uuid) TO authenticated, service_role, postgres;
+GRANT EXECUTE ON FUNCTION public.assert_provider_covers_area(uuid, uuid) TO authenticated, anon, service_role, postgres;
 
 
 -- ============================================================================
@@ -207,7 +222,7 @@ END;
 $$;
 
 REVOKE EXECUTE ON FUNCTION public.validate_contact_share() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.validate_contact_share() TO authenticated, service_role, postgres;
+GRANT EXECUTE ON FUNCTION public.validate_contact_share() TO authenticated, anon, service_role, postgres;
 
 
 -- ============================================================================
@@ -296,7 +311,7 @@ END;
 $$;
 
 REVOKE EXECUTE ON FUNCTION public.request_contact_share(uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.request_contact_share(uuid) TO authenticated, service_role, postgres;
+GRANT EXECUTE ON FUNCTION public.request_contact_share(uuid) TO authenticated, anon, service_role, postgres;
 
 
 -- ============================================================================
@@ -304,7 +319,7 @@ GRANT EXECUTE ON FUNCTION public.request_contact_share(uuid) TO authenticated, s
 -- ============================================================================
 
 REVOKE EXECUTE ON FUNCTION public.respond_contact_share(uuid, boolean) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.respond_contact_share(uuid, boolean) TO authenticated, service_role, postgres;
+GRANT EXECUTE ON FUNCTION public.respond_contact_share(uuid, boolean) TO authenticated, anon, service_role, postgres;
 
 
 -- ============================================================================
@@ -496,7 +511,7 @@ END;
 $$;
 
 REVOKE EXECUTE ON FUNCTION public.transition_service_request(uuid, public.request_status, text) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.transition_service_request(uuid, public.request_status, text) TO authenticated, service_role, postgres;
+GRANT EXECUTE ON FUNCTION public.transition_service_request(uuid, public.request_status, text) TO authenticated, anon, service_role, postgres;
 
 
 -- ============================================================================
@@ -594,4 +609,4 @@ END;
 $$;
 
 REVOKE EXECUTE ON FUNCTION public.get_shared_contact_info(uuid, uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.get_shared_contact_info(uuid, uuid) TO authenticated, service_role, postgres;
+GRANT EXECUTE ON FUNCTION public.get_shared_contact_info(uuid, uuid) TO authenticated, anon, service_role, postgres;

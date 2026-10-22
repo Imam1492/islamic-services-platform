@@ -36,7 +36,11 @@ import * as jwtLib from 'jsonwebtoken';
 const jwt: typeof import('jsonwebtoken') = (jwtLib as any).default ?? jwtLib;
 import * as fs from 'fs';
 import * as path from 'path';
-import { randomInt } from 'crypto';
+import { randomUUID } from 'crypto';
+import {
+  resolveLocalDatabaseTestUrl,
+  shouldRunDatabaseIntegrationTests,
+} from './database-test-guard';
 
 interface TestUser {
   id: string;
@@ -44,7 +48,9 @@ interface TestUser {
   token: string;
 }
 
-const DB_URL = process.env.DATABASE_URL || 'postgresql://postgres:postgres@127.0.0.1:54322/postgres';
+const DB_URL = resolveLocalDatabaseTestUrl();
+const runDatabaseTests = shouldRunDatabaseIntegrationTests();
+const databaseDescribe = runDatabaseTests ? describe : describe.skip;
 const JWT_SECRET = process.env.SUPABASE_JWT_SECRET || 'super-secret-jwt-token-with-at-least-32-characters-long';
 
 function generateSupabaseJwt(userId: string, role: string = 'authenticated'): string {
@@ -67,10 +73,11 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
   let adminClient: Client;
 
   const testUser: TestUser = {
-    id: '34343434-3434-4434-8434-343434343434',
+    id: randomUUID(),
     name: 'Discovery Caller User',
-    token: generateSupabaseJwt('34343434-3434-4434-8434-343434343434'),
+    token: '',
   };
+  testUser.token = generateSupabaseJwt(testUser.id);
 
   async function createAuthClient(user: TestUser): Promise<Client> {
     const client = new Client({ connectionString: DB_URL });
@@ -87,7 +94,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
   let migration09Sql = '';
   let migration10Sql = '';
 
-  beforeAll(async () => {
+  beforeAll(() => {
     if (fs.existsSync(migration09Path)) {
       migration09Sql = fs.readFileSync(migration09Path, 'utf8');
     }
@@ -95,21 +102,6 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
       migration10Sql = fs.readFileSync(migration10Path, 'utf8');
     }
 
-    adminClient = new Client({ connectionString: DB_URL });
-    try {
-      await adminClient.connect();
-      isDbConnected = true;
-    } catch {
-      isDbConnected = false;
-      if (process.env.CI === 'true') {
-        throw new Error('Database connection required in CI environment; discovery security tests cannot run.');
-      }
-      console.warn(
-        '[WARN] PostgreSQL database connection unavailable on ' +
-          DB_URL +
-          '. Running static architecture validations and skipping live queries.'
-      );
-    }
   });
 
   afterAll(async () => {
@@ -243,7 +235,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
   // LIVE DATABASE EXECUTION TESTS (RUN WHEN POSTGRESQL IS CONNECTED)
   // ==========================================================================
 
-  describe('Live Database Security & Authorization Integration Tests', () => {
+  databaseDescribe('Live Database Security & Authorization Integration Tests', () => {
     let areaAId: string;
     let areaBId: string;
     let inactiveAreaId: string;
@@ -263,34 +255,52 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
 
     const createdUserIds: string[] = [];
     const createdProviderIds: string[] = [];
+    const createdLocationIds: string[] = [];
+    const createdCategoryIds: string[] = [];
+    const createdServiceIds: string[] = [];
+    const runToken = randomUUID().replace(/-/g, '');
 
     beforeAll(async () => {
-      if (!isDbConnected) return;
+      adminClient = new Client({ connectionString: DB_URL });
+      try {
+        await adminClient.connect();
+        isDbConnected = true;
+      } catch {
+        throw new Error(
+          'Database integration tests were enabled, but the approved local PostgreSQL target could not be reached (127.0.0.1:54322/postgres).'
+        );
+      }
 
       // 1. Setup location hierarchy (Country -> State -> City -> Areas)
       const countryRes = await adminClient.query(
         `INSERT INTO public.locations (name, level) VALUES ('Disc Country', 'country') RETURNING id;`
       );
+      createdLocationIds.push(countryRes.rows[0].id);
       const stateRes = await adminClient.query(
         `INSERT INTO public.locations (name, level, parent_id) VALUES ('Disc State', 'state', $1) RETURNING id;`,
         [countryRes.rows[0].id]
       );
+      createdLocationIds.push(stateRes.rows[0].id);
       const cityRes = await adminClient.query(
         `INSERT INTO public.locations (name, level, parent_id) VALUES ('Disc City', 'city', $1) RETURNING id;`,
         [stateRes.rows[0].id]
       );
+      createdLocationIds.push(cityRes.rows[0].id);
       const areaARes = await adminClient.query(
         `INSERT INTO public.locations (name, level, parent_id) VALUES ('Disc Area A', 'area', $1) RETURNING id;`,
         [cityRes.rows[0].id]
       );
+      createdLocationIds.push(areaARes.rows[0].id);
       const areaBRes = await adminClient.query(
         `INSERT INTO public.locations (name, level, parent_id) VALUES ('Disc Area B', 'area', $1) RETURNING id;`,
         [cityRes.rows[0].id]
       );
+      createdLocationIds.push(areaBRes.rows[0].id);
       const inactAreaRes = await adminClient.query(
         `INSERT INTO public.locations (name, level, parent_id, is_active) VALUES ('Disc Inactive Area', 'area', $1, false) RETURNING id;`,
         [cityRes.rows[0].id]
       );
+      createdLocationIds.push(inactAreaRes.rows[0].id);
 
       areaAId = areaARes.rows[0].id;
       areaBId = areaBRes.rows[0].id;
@@ -298,71 +308,64 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
 
       // 2. Setup categories and services
       const catARes = await adminClient.query(
-        `INSERT INTO public.categories (name, slug) VALUES ('Disc Cat A', 'disc-cat-a') RETURNING id;`
+        `INSERT INTO public.categories (name, slug) VALUES ($1, $2) RETURNING id;`,
+        [`Disc Cat A ${runToken}`, `disc-cat-a-${runToken}`]
       );
+      createdCategoryIds.push(catARes.rows[0].id);
       const inactCatRes = await adminClient.query(
-        `INSERT INTO public.categories (name, slug, is_active) VALUES ('Disc Inactive Cat', 'disc-inact-cat', false) RETURNING id;`
+        `INSERT INTO public.categories (name, slug, is_active) VALUES ($1, $2, false) RETURNING id;`,
+        [`Disc Inactive Cat ${runToken}`, `disc-inact-cat-${runToken}`]
       );
+      createdCategoryIds.push(inactCatRes.rows[0].id);
       catAId = catARes.rows[0].id;
       inactiveCatId = inactCatRes.rows[0].id;
 
       const servARes = await adminClient.query(
-        `INSERT INTO public.services (category_id, name, slug) VALUES ($1, 'Disc Service A', 'disc-serv-a') RETURNING id;`,
-        [catAId]
+        `INSERT INTO public.services (category_id, name, slug) VALUES ($1, 'Disc Service A', $2) RETURNING id;`,
+        [catAId, `disc-serv-a-${runToken}`]
       );
+      createdServiceIds.push(servARes.rows[0].id);
       const servBRes = await adminClient.query(
-        `INSERT INTO public.services (category_id, name, slug) VALUES ($1, 'Disc Service B', 'disc-serv-b') RETURNING id;`,
-        [catAId]
+        `INSERT INTO public.services (category_id, name, slug) VALUES ($1, 'Disc Service B', $2) RETURNING id;`,
+        [catAId, `disc-serv-b-${runToken}`]
       );
+      createdServiceIds.push(servBRes.rows[0].id);
       const inactServRes = await adminClient.query(
-        `INSERT INTO public.services (category_id, name, slug, is_active) VALUES ($1, 'Disc Inactive Serv', 'disc-inact-serv', false) RETURNING id;`,
-        [catAId]
+        `INSERT INTO public.services (category_id, name, slug, is_active) VALUES ($1, 'Disc Inactive Serv', $2, false) RETURNING id;`,
+        [catAId, `disc-inact-serv-${runToken}`]
       );
+      createdServiceIds.push(inactServRes.rows[0].id);
       const servUnderInactCatRes = await adminClient.query(
-        `INSERT INTO public.services (category_id, name, slug) VALUES ($1, 'Disc Serv Under Inact Cat', 'disc-serv-inact-cat') RETURNING id;`,
-        [inactiveCatId]
+        `INSERT INTO public.services (category_id, name, slug) VALUES ($1, 'Disc Serv Under Inact Cat', $2) RETURNING id;`,
+        [inactiveCatId, `disc-serv-inact-cat-${runToken}`]
       );
+      createdServiceIds.push(servUnderInactCatRes.rows[0].id);
 
       serviceAId = servARes.rows[0].id;
       serviceBId = servBRes.rows[0].id;
       inactiveServiceId = inactServRes.rows[0].id;
       serviceUnderInactiveCatId = servUnderInactCatRes.rows[0].id;
 
-      // Deterministic per-run sequence and high-entropy run token:
-      // E.164 pattern: ^\+[1-9]\d{1,14}$
-      // Conforms to realistic Indian mobile format (+91 followed by 10 national digits starting with 9)
-      let providerSeq = 0;
-      // High-entropy 6-digit run token (domain of 900,000 values: 100000 - 999999):
-      const runToken = randomInt(100000, 1000000);
-
       /**
        * Generates a valid E.164 phone number with the following guarantees:
-       * 1. INTRA-RUN UNIQUENESS (STRICT): Monotonically incrementing providerSeq guarantees
-       *    that every provider created within a single test run receives a strictly distinct
-       *    phone number, preventing users_phone_key uniqueness violations.
-       * 2. CROSS-RUN COLLISION MITIGATION: The 6-digit cryptographically random runToken
-       *    provides 900,000 distinct buckets across process runs.
-       * 3. TEARDOWN RELIANCE: This does NOT claim absolute collision safety across indefinite
-       *    re-runs on a persistent unreset database without teardown. Instead, cross-run reuse
-       *    relies upon the afterAll hook to delete created auth.users / provider records, as
-       *    well as CI ephemeral database resets (supabase db reset).
+       * 1. Each phone is derived from its own random UUID, so fixture identities do not
+       *    depend on cleanup of users retained by immutable audit rows.
+       * 2. UUID-derived E.164 digits make cross-run phone collisions negligible.
        */
-      function generateUniqueTestPhone(): string {
-        providerSeq += 1;
-        const seqStr = String(providerSeq).padStart(3, '0');
-        return `+919${runToken}${seqStr}`;
+      function phoneForTestUser(userId: string): string {
+        const digits = BigInt(`0x${userId.replace(/-/g, '')}`).toString().slice(0, 13);
+        return `+1${digits}`;
       }
 
       // Helper to provision provider
       async function createTestProvider(name: string, status: string, gender: string, exp: number, areaId: string, servId: string) {
-        const testPhone = generateUniqueTestPhone();
-        const testEmail = `${name.toLowerCase().replace(/\s+/g, '')}_${providerSeq}@example.com`;
-        const uId = (await adminClient.query(
+        const uId = randomUUID();
+        const testPhone = phoneForTestUser(uId);
+        await adminClient.query(
           `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
-           VALUES (gen_random_uuid(), $1, $2, jsonb_build_object('full_name', $3::text))
-           RETURNING id;`,
-          [testEmail, testPhone, name]
-        )).rows[0].id;
+           VALUES ($1, $2, $3, jsonb_build_object('full_name', $4::text))`,
+          [uId, `${uId}@example.test`, testPhone, name]
+        );
         createdUserIds.push(uId);
 
         const profId = (await adminClient.query(
@@ -398,7 +401,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('1. Authenticated discovery succeeds for valid inputs', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         const res = await client.query(
@@ -414,7 +417,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('2. Unauthenticated discovery is rejected (fails closed)', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const anonClient = new Client({ connectionString: DB_URL });
       await anonClient.connect();
       try {
@@ -428,7 +431,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('3. Approved provider in matching area/service is returned', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         const res = await client.query(
@@ -445,7 +448,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('4–6. Pending, area_reviewed, and suspended providers are strictly excluded', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         const res = await client.query(
@@ -462,7 +465,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('7. Wrong-area provider is not returned', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         const res = await client.query(
@@ -477,7 +480,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('8. Wrong-service provider is not returned', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         const res = await client.query(
@@ -492,7 +495,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('9–10. Inactive service or service under inactive category is rejected', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         await expect(
@@ -508,7 +511,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('11. Inactive area is rejected', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         await expect(
@@ -520,7 +523,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('12–15. Provider phone, user_id, verification records, notes, reviewer IDs are never returned', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         const res = await client.query(
@@ -543,7 +546,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('16. Required badge filter works', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         // Search with badge that provider HAS
@@ -565,7 +568,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('17. Gender filter works', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         const resMale = await client.query(
@@ -585,7 +588,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('18. Minimum experience filter works', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         const resExp = await client.query(
@@ -600,7 +603,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('19–20. Keyset pagination is deterministic and duplicate-free', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         const resP1 = await client.query(
@@ -631,7 +634,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('21–22. Arbitrary/tampered area or service IDs fail safely', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         const fakeId = '00000000-0000-0000-0000-000000000000';
@@ -648,7 +651,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('23. Unapproved provider profile cannot be retrieved via get_public_provider_profile', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         await expect(
@@ -664,7 +667,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('24. Approved provider profile exposes only intended public fields', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         const res = await client.query(
@@ -691,7 +694,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('25. Inactive services/areas do not appear in provider profile', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       let tempAreaId: string | null = null;
       let tempServiceId: string | null = null;
@@ -712,7 +715,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
         );
         tempAreaId = areaRes.rows[0].id;
 
-        const tempSlug = `disc-deact-serv-${randomInt(100000, 1000000)}`;
+        const tempSlug = `disc-deact-serv-${runToken}`;
         const servRes = await adminClient.query(
           `INSERT INTO public.services (category_id, name, slug, is_active)
            VALUES ($1, 'Disc Test Active-Then-Inactive Service', $2, true)
@@ -767,28 +770,28 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
           await adminClient.query(
             `DELETE FROM public.provider_locations WHERE provider_id = $1 AND location_id = $2;`,
             [approvedProvId, tempAreaId]
-          ).catch(() => {});
+          );
           await adminClient.query(
             `DELETE FROM public.locations WHERE id = $1;`,
             [tempAreaId]
-          ).catch(() => {});
+          );
         }
         if (tempServiceId) {
           await adminClient.query(
             `DELETE FROM public.provider_services WHERE provider_id = $1 AND service_id = $2;`,
             [approvedProvId, tempServiceId]
-          ).catch(() => {});
+          );
           await adminClient.query(
             `DELETE FROM public.services WHERE id = $1;`,
             [tempServiceId]
-          ).catch(() => {});
+          );
         }
         await client.end();
       }
     });
 
     test('26–27. RPC execution privileges are restricted and search_path is hardened', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const procRes = await adminClient.query(`
         SELECT p.proname, p.prosecdef, p.proconfig
         FROM pg_proc p
@@ -804,7 +807,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('28. Migration 10: Authenticated client direct SELECT on public.provider_badges is denied', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         try {
@@ -819,7 +822,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('29. Migration 10: Anonymous client direct SELECT on public.provider_badges is denied', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const anonClient = new Client({ connectionString: DB_URL });
       await anonClient.connect();
       try {
@@ -831,7 +834,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('30–32. Migration 10: Direct INSERT, UPDATE, DELETE on public.provider_badges is denied to client', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         await expect(
@@ -860,7 +863,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('33. Migration 10: discover_providers() still returns approved public badge_type data', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         const res = await client.query(
@@ -877,7 +880,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('34. Migration 10: get_public_provider_profile() still returns approved public badge data', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUser);
       try {
         const res = await client.query(
@@ -893,7 +896,7 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
     });
 
     test('35. Migration 10: Badge synchronization trigger remains intact and service_role can manage badges', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const badgeCountRes = await adminClient.query(
         `SELECT COUNT(*)::int as count FROM public.provider_badges WHERE provider_id = $1;`,
         [approvedProvId]
@@ -911,25 +914,34 @@ describe('Phase 3.4.1: Database Discovery Foundation Security & Integration Test
 
     afterAll(async () => {
       if (!isDbConnected || !adminClient) return;
-      try {
-        for (const provId of createdProviderIds) {
-          await adminClient.query(`DELETE FROM public.provider_badges WHERE provider_id = $1;`, [provId]);
-          await adminClient.query(`DELETE FROM public.provider_locations WHERE provider_id = $1;`, [provId]);
-          await adminClient.query(`DELETE FROM public.provider_services WHERE provider_id = $1;`, [provId]);
-          await adminClient.query(`DELETE FROM public.provider_profiles WHERE id = $1;`, [provId]);
-        }
-        for (const uId of createdUserIds) {
-          await adminClient.query(`DELETE FROM public.user_roles WHERE user_id = $1;`, [uId]);
-          await adminClient.query(`DELETE FROM public.user_private WHERE user_id = $1;`, [uId]);
-          await adminClient.query(`DELETE FROM public.users WHERE id = $1;`, [uId]);
-          await adminClient.query(`DELETE FROM auth.users WHERE id = $1;`, [uId]);
-        }
-      } catch (err) {
-        // Safe logging if cleanup encounters non-fatal issue
+      for (const provId of createdProviderIds) {
+        await adminClient.query(`DELETE FROM public.provider_badges WHERE provider_id = $1;`, [provId]);
+        await adminClient.query(`DELETE FROM public.provider_locations WHERE provider_id = $1;`, [provId]);
+        await adminClient.query(`DELETE FROM public.provider_services WHERE provider_id = $1;`, [provId]);
+        await adminClient.query(`DELETE FROM public.provider_profiles WHERE id = $1;`, [provId]);
       }
-      // Note: Immutable audit_logs (public.audit_logs) and user consents (public.user_consents)
-      // are strictly append-only and immutable by database triggers and architectural design.
-      // Therefore, they are not mutated or deleted during cleanup.
+      for (const uId of createdUserIds) {
+        await adminClient.query(`DELETE FROM public.user_roles WHERE user_id = $1;`, [uId]);
+        await adminClient.query(`DELETE FROM public.user_private WHERE user_id = $1;`, [uId]);
+        await adminClient.query(`DELETE FROM public.users WHERE id = $1
+          AND NOT EXISTS (SELECT 1 FROM public.audit_logs WHERE actor_id = $1)
+          AND NOT EXISTS (SELECT 1 FROM public.user_consents WHERE user_id = $1);`, [uId]);
+        await adminClient.query(`DELETE FROM auth.users WHERE id = $1
+          AND NOT EXISTS (SELECT 1 FROM public.audit_logs WHERE actor_id = $1)
+          AND NOT EXISTS (SELECT 1 FROM public.user_consents WHERE user_id = $1);`, [uId]);
+      }
+      for (const serviceId of createdServiceIds) {
+        await adminClient.query(`DELETE FROM public.services WHERE id = $1;`, [serviceId]);
+      }
+      for (const categoryId of createdCategoryIds) {
+        await adminClient.query(`DELETE FROM public.categories WHERE id = $1;`, [categoryId]);
+      }
+      if (createdLocationIds.length) {
+        for (const locationId of createdLocationIds.reverse()) {
+          await adminClient.query(`DELETE FROM public.locations WHERE id = $1;`, [locationId]);
+        }
+      }
+      // Immutable audit rows are retained; actor accounts referenced by them are retained too.
     });
   });
 });

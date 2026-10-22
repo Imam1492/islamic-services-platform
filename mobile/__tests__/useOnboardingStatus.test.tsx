@@ -2,6 +2,14 @@ import { renderHook, act } from '@testing-library/react-native';
 import { useOnboardingStatus } from '../src/hooks/useOnboardingStatus';
 import { OnboardingService } from '../src/services/onboardingService';
 
+jest.mock('../src/lib/secureStorage', () => ({
+  LargeSecureStoreAdapter: {
+    getItem: jest.fn().mockResolvedValue(null),
+    setItem: jest.fn().mockResolvedValue(undefined),
+    removeItem: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
 jest.mock('../src/services/onboardingService');
 
 describe('useOnboardingStatus Hook Lifecycle & Concurrency Suite', () => {

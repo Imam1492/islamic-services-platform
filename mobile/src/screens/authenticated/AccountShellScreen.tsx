@@ -14,6 +14,7 @@ export function AccountShellScreen({ onboardedAt }: AccountShellScreenProps) {
   const { session, signOut } = useAuth();
   const [activeModalDoc, setActiveModalDoc] = useState<LegalDocument | null>(null);
   const [isSigningOut, setIsSigningOut] = useState<boolean>(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
 
   const user = session?.user;
   const maskedPhone = maskPhone(user?.phone);
@@ -26,8 +27,12 @@ export function AccountShellScreen({ onboardedAt }: AccountShellScreenProps) {
   const handleSignOut = async () => {
     if (isSigningOut) return;
     setIsSigningOut(true);
+    setSignOutError(null);
     try {
-      await signOut();
+      const { error } = await signOut();
+      if (error) setSignOutError('Sign out could not be confirmed. Please try again.');
+    } catch {
+      setSignOutError('Sign out could not be confirmed. Please try again.');
     } finally {
       setIsSigningOut(false);
     }
@@ -134,6 +139,12 @@ export function AccountShellScreen({ onboardedAt }: AccountShellScreenProps) {
         </View>
 
         {/* Sign Out Button */}
+        {signOutError ? (
+          <Text style={styles.signOutError} accessibilityRole="alert" testID="account-signout-error">
+            {signOutError}
+          </Text>
+        ) : null}
+
         <Pressable
           style={({ pressed }) => [
             styles.signOutButton,
@@ -295,6 +306,12 @@ const styles = StyleSheet.create({
   },
   signOutButtonPressed: {
     backgroundColor: '#FECACA',
+  },
+  signOutError: {
+    color: '#991B1B',
+    fontSize: 14,
+    textAlign: 'center',
+    marginBottom: 12,
   },
   signOutButtonText: {
     fontSize: 15,

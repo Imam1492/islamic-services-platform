@@ -18,6 +18,8 @@
 --  13. Privacy Protection: get_shared_contact_info denied when request is COMPLETED (P0001).
 --  14. Atomicity & Rollback: terminal transition failure rolls back request and share status.
 --  15. Lifecycle Concurrency: request_contact_share rejected on terminal requests (P0001).
+--  16. Direct service_requests.status UPDATE is rejected for authenticated.
+--  17. Requesters can update only notes on their own REQUESTED service request.
 --
 -- SAFETY & ISOLATION:
 --   - Uses 100% test-owned, isolated fixtures with dynamically generated unique IDs (gen_random_uuid()).
@@ -109,9 +111,15 @@ BEGIN
   -- populates public.users, public.user_roles ('user'), and public.user_private (with phone_e164).
   INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
   VALUES
-    (v_customer_id, format('staging_cust_%s@example.com', substr(v_customer_id::text, 1, 8)), '+12025550181', '{"full_name": "Staging Customer"}'::jsonb),
-    (v_provider_user_id, format('staging_prov_%s@example.com', substr(v_provider_user_id::text, 1, 8)), '+12025550182', '{"full_name": "Staging Provider"}'::jsonb),
-    (v_third_party_id, format('staging_third_%s@example.com', substr(v_third_party_id::text, 1, 8)), '+12025550183', '{"full_name": "Staging Third Party"}'::jsonb);
+    (v_customer_id, format('staging_cust_%s@example.com', substr(v_customer_id::text, 1, 8)),
+      '+1' || lpad((1000000000000 + floor(random() * 9000000000000)::bigint)::text, 13, '0'),
+      '{"full_name": "Staging Customer"}'::jsonb),
+    (v_provider_user_id, format('staging_prov_%s@example.com', substr(v_provider_user_id::text, 1, 8)),
+      '+1' || lpad((1000000000000 + floor(random() * 9000000000000)::bigint)::text, 13, '0'),
+      '{"full_name": "Staging Provider"}'::jsonb),
+    (v_third_party_id, format('staging_third_%s@example.com', substr(v_third_party_id::text, 1, 8)),
+      '+1' || lpad((1000000000000 + floor(random() * 9000000000000)::bigint)::text, 13, '0'),
+      '{"full_name": "Staging Third Party"}'::jsonb);
 
   -- Assign provider role to provider user (default 'user' role was created by handle_new_auth_user)
   INSERT INTO public.user_roles (user_id, role)
@@ -627,9 +635,17 @@ BEGIN
   -- --------------------------------------------------------------------------
   -- TEST 13: Privacy - get_shared_contact_info Denied in COMPLETED Terminal State
   -- --------------------------------------------------------------------------
-  -- Re-share contact
+  -- The share is currently 'shared' from Test 11. Revoke and re-request it
+  -- first so recipient approval below exercises the valid pending -> shared
+  -- transition instead of attempting to approve an already-shared record.
   PERFORM set_config('request.jwt.claim.sub', v_customer_id::text, true);
+  PERFORM public.respond_contact_share(v_share_id, false);
   v_res := public.request_contact_share(v_request_id);
+  SELECT status::text INTO v_status FROM public.contact_shares WHERE id = v_share_id;
+  IF v_status <> 'pending' THEN
+    RAISE EXCEPTION 'Test 13 setup expected pending contact share after re-request, got %', v_status;
+  END IF;
+
   PERFORM set_config('request.jwt.claim.sub', v_provider_user_id::text, true);
   PERFORM public.respond_contact_share(v_share_id, true);
 
@@ -837,6 +853,161 @@ $$;
 -- ----------------------------------------------------------------------------
 -- FINAL RESULTS SUMMARY
 -- ----------------------------------------------------------------------------
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claim.role', 'authenticated', true);
+DO $$
+DECLARE
+  v_customer_id uuid;
+BEGIN
+  SELECT customer_id INTO v_customer_id FROM pg_temp.staging_test_fixtures;
+  PERFORM set_config('request.jwt.claim.sub', v_customer_id::text, true);
+END;
+$$;
+
+DO $$
+DECLARE
+  v_request_id uuid;
+  v_customer_id uuid;
+  v_old_status public.request_status;
+  v_new_status public.request_status;
+  v_expected_failure boolean := false;
+  v_details text := 'Unexpectedly succeeded';
+BEGIN
+  SELECT request_id, customer_id INTO v_request_id, v_customer_id
+  FROM pg_temp.staging_test_fixtures;
+  SELECT status INTO v_old_status FROM public.service_requests WHERE id = v_request_id;
+
+  BEGIN
+    UPDATE public.service_requests
+    SET status = CASE
+      WHEN status = 'CANCELLED'::public.request_status THEN 'COMPLETED'::public.request_status
+      ELSE 'CANCELLED'::public.request_status
+    END
+    WHERE id = v_request_id;
+  EXCEPTION WHEN insufficient_privilege THEN
+    v_expected_failure := true;
+    v_details := 'Rejected with 42501 (insufficient_privilege)';
+  WHEN OTHERS THEN
+    v_details := format('Unexpected error %s: %s', SQLSTATE, SQLERRM);
+  END;
+
+  SELECT status INTO v_new_status FROM public.service_requests WHERE id = v_request_id;
+  IF v_old_status IS DISTINCT FROM v_new_status THEN
+    v_expected_failure := false;
+    v_details := format('Status changed from %s to %s', v_old_status, v_new_status);
+  END IF;
+
+  INSERT INTO pg_temp.staging_test_results VALUES (
+    16,
+    'authenticated direct UPDATE of service_requests.status prohibited',
+    v_expected_failure,
+    v_details
+  );
+  IF v_expected_failure THEN
+    RAISE NOTICE 'Test 16 [PASS]: Direct service_requests.status UPDATE rejected with 42501';
+  ELSE
+    RAISE NOTICE 'Test 16 [FAIL]: Direct status UPDATE was permitted or failed unexpectedly: %', v_details;
+  END IF;
+END;
+$$;
+RESET ROLE;
+
+-- ----------------------------------------------------------------------------
+-- TEST 17: Requesters may update only notes on their own REQUESTED request
+-- ----------------------------------------------------------------------------
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claim.role', 'authenticated', true);
+DO $$
+DECLARE
+  v_customer_id uuid;
+  v_third_party_id uuid;
+  v_provider_profile_id uuid;
+  v_service_id uuid;
+  v_area_id uuid;
+  v_request_id uuid;
+  v_row_count int;
+  v_notes text;
+  v_status public.request_status;
+  v_notes_ok boolean := false;
+  v_user_id_blocked boolean := false;
+  v_event_date_blocked boolean := false;
+  v_status_blocked boolean := false;
+  v_other_user_blocked boolean := false;
+  v_privileges_ok boolean;
+BEGIN
+  SELECT customer_id, third_party_id, provider_profile_id, service_id, area_id
+  INTO v_customer_id, v_third_party_id, v_provider_profile_id, v_service_id, v_area_id
+  FROM pg_temp.staging_test_fixtures;
+  PERFORM set_config('request.jwt.claim.sub', v_customer_id::text, true);
+
+  INSERT INTO public.service_requests (user_id, provider_id, service_id, location_id, status, notes)
+  VALUES (v_customer_id, v_provider_profile_id, v_service_id, v_area_id, 'REQUESTED', 'Initial requester note')
+  RETURNING id INTO v_request_id;
+
+  UPDATE public.service_requests SET notes = 'Revised requester note' WHERE id = v_request_id;
+  GET DIAGNOSTICS v_row_count = ROW_COUNT;
+  v_notes_ok := v_row_count = 1;
+
+  BEGIN
+    UPDATE public.service_requests SET user_id = v_third_party_id WHERE id = v_request_id;
+  EXCEPTION WHEN insufficient_privilege THEN
+    v_user_id_blocked := true;
+  END;
+
+  BEGIN
+    UPDATE public.service_requests SET event_date = now() WHERE id = v_request_id;
+  EXCEPTION WHEN insufficient_privilege THEN
+    v_event_date_blocked := true;
+  END;
+
+  BEGIN
+    UPDATE public.service_requests SET status = 'CANCELLED'::public.request_status WHERE id = v_request_id;
+  EXCEPTION WHEN insufficient_privilege THEN
+    v_status_blocked := true;
+  WHEN OTHERS THEN
+    IF SQLSTATE = 'P0001' THEN
+      v_status_blocked := true;
+    END IF;
+  END;
+
+  PERFORM set_config('request.jwt.claim.sub', v_third_party_id::text, true);
+  UPDATE public.service_requests SET notes = 'Unauthorized note' WHERE id = v_request_id;
+  GET DIAGNOSTICS v_row_count = ROW_COUNT;
+  v_other_user_blocked := v_row_count = 0;
+
+  PERFORM set_config('request.jwt.claim.sub', v_customer_id::text, true);
+  SELECT notes, status INTO v_notes, v_status
+  FROM public.service_requests WHERE id = v_request_id;
+
+  v_privileges_ok := NOT has_table_privilege('authenticated', 'public.service_requests', 'UPDATE')
+    AND has_column_privilege('authenticated', 'public.service_requests', 'notes', 'UPDATE')
+    AND NOT has_column_privilege('authenticated', 'public.service_requests', 'id', 'UPDATE')
+    AND NOT has_column_privilege('authenticated', 'public.service_requests', 'user_id', 'UPDATE')
+    AND NOT has_column_privilege('authenticated', 'public.service_requests', 'provider_id', 'UPDATE')
+    AND NOT has_column_privilege('authenticated', 'public.service_requests', 'service_id', 'UPDATE')
+    AND NOT has_column_privilege('authenticated', 'public.service_requests', 'location_id', 'UPDATE')
+    AND NOT has_column_privilege('authenticated', 'public.service_requests', 'status', 'UPDATE')
+    AND NOT has_column_privilege('authenticated', 'public.service_requests', 'event_date', 'UPDATE')
+    AND NOT has_column_privilege('authenticated', 'public.service_requests', 'created_at', 'UPDATE')
+    AND NOT has_column_privilege('authenticated', 'public.service_requests', 'updated_at', 'UPDATE')
+    AND NOT has_column_privilege('anon', 'public.service_requests', 'notes', 'UPDATE');
+
+  IF v_notes_ok AND v_user_id_blocked AND v_event_date_blocked AND v_status_blocked
+     AND v_other_user_blocked AND v_privileges_ok
+     AND v_notes = 'Revised requester note'
+     AND v_status = 'REQUESTED'::public.request_status THEN
+    INSERT INTO pg_temp.staging_test_results VALUES (17, 'Requester can update only notes on own REQUESTED service request', true, 'notes update allowed; protected fields, other user, and all other UPDATE privileges denied');
+    RAISE NOTICE 'Test 17 [PASS]: Notes-only requester UPDATE contract enforced';
+  ELSE
+    INSERT INTO pg_temp.staging_test_results VALUES (17, 'Requester can update only notes on own REQUESTED service request', false,
+      format('notes=%s user_id_blocked=%s event_date_blocked=%s status_blocked=%s other_user_blocked=%s privileges=%s final_status=%s',
+        v_notes_ok, v_user_id_blocked, v_event_date_blocked, v_status_blocked, v_other_user_blocked, v_privileges_ok, v_status));
+    RAISE NOTICE 'Test 17 [FAIL]: Notes-only requester UPDATE contract not enforced';
+  END IF;
+END;
+$$;
+RESET ROLE;
+
 DO $$
 DECLARE
   v_total int;
@@ -863,7 +1034,7 @@ BEGIN
 
   RAISE NOTICE '============================================================';
 
-  IF v_failed > 0 OR v_total < 15 THEN
+  IF v_failed > 0 OR v_total < 17 THEN
     RAISE EXCEPTION 'Staging security test suite failed with % failure(s) out of % tests', v_failed, v_total;
   END IF;
 END;

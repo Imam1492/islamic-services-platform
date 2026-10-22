@@ -11,18 +11,33 @@ import type { Session, User, AuthError } from '@supabase/supabase-js';
 import * as WebBrowser from 'expo-web-browser';
 import * as Linking from 'expo-linking';
 import { supabase } from '../lib/supabase';
+import { LargeSecureStoreAdapter } from '../lib/secureStorage';
 
 // Ensure browser session completes properly on Android and web
 WebBrowser.maybeCompleteAuthSession();
 
+export type AuthNavigationGate = 'loading' | 'ready' | 'password-recovery' | 'storage-error';
+
 export interface AuthContextValue {
   session: Session | null;
+  authNavigationGate: AuthNavigationGate;
+  authStorageFailure: boolean;
+  clearLocalAuthState: () => Promise<{ error: AuthError | null }>;
   user: User | null;
   loading: boolean;
+  passwordRecovery: boolean;
+  passwordRecoveryPersistenceFailed: boolean;
   signInWithGoogle: () => Promise<{
     error: Error | AuthError | null;
     isCancelled?: boolean;
   }>;
+  signUpWithEmail: (
+    email: string,
+    password: string
+  ) => Promise<{ error: AuthError | null; needsEmailVerification: boolean }>;
+  signInWithEmail: (email: string, password: string) => Promise<{ error: AuthError | null }>;
+  requestPasswordReset: (email: string) => Promise<{ error: AuthError | null }>;
+  updatePassword: (password: string) => Promise<{ error: AuthError | null }>;
   signOut: () => Promise<{ error: AuthError | null }>;
   refreshSession: () => Promise<{
     session: Session | null;
@@ -32,6 +47,16 @@ export interface AuthContextValue {
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
+const MOBILE_AUTH_CALLBACK_URL = 'islamicservices://auth/callback';
+const PASSWORD_RECOVERY_PENDING_KEY = 'islamicservices.auth.password-recovery-pending';
+
+function recoveryStorageAuthError(): AuthError {
+  return {
+    name: 'RecoveryStatePersistenceError',
+    message: 'Unable to safely verify local authentication state',
+    status: 500,
+  } as AuthError;
+}
 
 export interface AuthProviderProps {
   children: React.ReactNode;
@@ -40,68 +65,65 @@ export interface AuthProviderProps {
 export function isAuthCallbackUrl(url: string | null | undefined): boolean {
   if (!url || typeof url !== 'string') return false;
   try {
-    const parsed = Linking.parse(url);
-    const hostname = parsed.hostname || '';
-    const path = parsed.path ? parsed.path.replace(/^\/+|\/+$/g, '') : '';
-    const combined = [hostname, path].filter(Boolean).join('/');
+    const parsed = new URL(url);
     return (
-      combined === 'auth/callback' ||
-      combined.startsWith('auth/callback') ||
-      url.includes('auth/callback') ||
-      (url.startsWith('islamicservices://auth') &&
-        (url.includes('code=') || url.includes('error=')))
+      parsed.protocol === 'islamicservices:' &&
+      parsed.hostname === 'auth' &&
+      parsed.pathname === '/callback' &&
+      !parsed.username &&
+      !parsed.password &&
+      !parsed.port
     );
   } catch {
-    return (
-      url.includes('auth/callback') ||
-      (url.startsWith('islamicservices://') && url.includes('code='))
-    );
+    return false;
   }
 }
 
 export function extractCodeFromUrl(url: string | null | undefined): string | null {
   if (!url || typeof url !== 'string') return null;
   try {
-    const parsed = Linking.parse(url);
-    const code = parsed.queryParams?.code;
-    if (typeof code === 'string' && code.trim().length > 0) {
-      return code.trim();
-    }
-  } catch {}
-  const match = url.match(/[?&#]code=([^&#]+)/);
-  if (match && match[1]) {
-    try {
-      return decodeURIComponent(match[1]);
-    } catch {
-      return match[1];
-    }
+    if (!isAuthCallbackUrl(url)) return null;
+    const parsed = new URL(url);
+    const codes = parsed.searchParams.getAll('code');
+    return codes.length === 1 && codes[0].trim() ? codes[0].trim() : null;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 export function extractErrorFromUrl(url: string | null | undefined): string | null {
   if (!url || typeof url !== 'string') return null;
   try {
-    const parsed = Linking.parse(url);
-    const err = parsed.queryParams?.error_description || parsed.queryParams?.error;
-    if (typeof err === 'string' && err.trim().length > 0) {
-      return err.trim();
-    }
-  } catch {}
-  const match = url.match(/[?&#]error(?:_description)?=([^&#]+)/);
-  if (match && match[1]) {
-    try {
-      return decodeURIComponent(match[1]);
-    } catch {
-      return match[1];
-    }
+    if (!isAuthCallbackUrl(url)) return null;
+    const parsed = new URL(url);
+    const fragmentParams = new URLSearchParams(parsed.hash.slice(1));
+    return parsed.searchParams.has('error') || fragmentParams.has('error')
+      ? 'Google sign-in was denied or cancelled.'
+      : null;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 export function AuthProvider({ children }: AuthProviderProps) {
   const [session, setSession] = useState<Session | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
+  const [authNavigationGateState, setAuthNavigationGateState] =
+    useState<AuthNavigationGate>('loading');
+  const authNavigationGateRef = useRef<AuthNavigationGate>('loading');
+  const setAuthNavigationGate = useCallback((gate: AuthNavigationGate) => {
+    authNavigationGateRef.current = gate;
+    setAuthNavigationGateState(gate);
+  }, []);
+  const loading = authNavigationGateState === 'loading';
+  const authStorageFailure = authNavigationGateState === 'storage-error';
+  const [passwordRecovery, setPasswordRecovery] = useState<boolean>(false);
+  const [passwordRecoveryPersistenceFailed, setPasswordRecoveryPersistenceFailed] = useState(false);
+  const passwordRecoveryRef = useRef(false);
+  const authStateVersionRef = useRef(0);
+  const recoveryMarkerWriteRef = useRef<Promise<void>>(Promise.resolve());
+  const recoveryMarkerRevisionRef = useRef(0);
+  const authProviderMountedRef = useRef(false);
+  const authInitializationResolvedRef = useRef(false);
 
   const processedCodesRef = useRef<Set<string>>(new Set());
   const inFlightExchangesRef = useRef<
@@ -115,6 +137,81 @@ export function AuthProvider({ children }: AuthProviderProps) {
     | null
   >(null);
   const callbackReceivedRef = useRef<boolean>(false);
+
+  const setPasswordRecoveryPending = useCallback(
+    async (pending: boolean) => {
+      const revision = ++recoveryMarkerRevisionRef.current;
+      if (pending) {
+        passwordRecoveryRef.current = true;
+        setPasswordRecovery(true);
+        setPasswordRecoveryPersistenceFailed(false);
+        setAuthNavigationGate('password-recovery');
+      }
+
+      // Serialize writes so an older pending write cannot override a later clear.
+      const markerWrite = recoveryMarkerWriteRef.current
+        .catch(() => {})
+        .then(() =>
+          pending
+            ? LargeSecureStoreAdapter.setItem(PASSWORD_RECOVERY_PENDING_KEY, 'true')
+            : LargeSecureStoreAdapter.removeItem(PASSWORD_RECOVERY_PENDING_KEY)
+        );
+      recoveryMarkerWriteRef.current = markerWrite;
+
+      try {
+        await markerWrite;
+      } catch {
+        if (
+          authProviderMountedRef.current &&
+          revision === recoveryMarkerRevisionRef.current
+        ) {
+          setPasswordRecoveryPersistenceFailed(true);
+          setSession(null);
+          setAuthNavigationGate('storage-error');
+
+          // If recording recovery mode fails, try to remove the local session and
+          // marker. The gate remains closed unless both operations are confirmed.
+          if (pending) {
+            try {
+              const { error } = await supabase.auth.signOut({ scope: 'local' });
+              if (error) throw error;
+              await LargeSecureStoreAdapter.removeItem(PASSWORD_RECOVERY_PENDING_KEY);
+              if (
+                authProviderMountedRef.current &&
+                revision === recoveryMarkerRevisionRef.current
+              ) {
+                setSession(null);
+                passwordRecoveryRef.current = false;
+                setPasswordRecovery(false);
+                setPasswordRecoveryPersistenceFailed(false);
+                setAuthNavigationGate('ready');
+              }
+            } catch {
+              // Storage state remains uncertain; only the explicit cleanup action
+              // can release the fail-closed navigation gate.
+            }
+          }
+        }
+        throw recoveryStorageAuthError();
+      }
+
+      if (
+        !authProviderMountedRef.current ||
+        revision !== recoveryMarkerRevisionRef.current
+      ) {
+        return;
+      }
+      setPasswordRecoveryPersistenceFailed(false);
+      passwordRecoveryRef.current = pending;
+      setPasswordRecovery(pending);
+      if (pending) {
+        setAuthNavigationGate('password-recovery');
+      } else {
+        setAuthNavigationGate('ready');
+      }
+    },
+    [setAuthNavigationGate]
+  );
 
   const exchangeAuthCode = useCallback(
     async (code: string): Promise<{ error: Error | AuthError | null }> => {
@@ -135,7 +232,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
           const { error: exchangeError } =
             await supabase.auth.exchangeCodeForSession(code);
           if (exchangeError) {
-            console.warn('[AuthContext] exchangeCodeForSession failed:', exchangeError.message);
+            console.warn('[AuthContext] Code exchange failed');
             return { error: exchangeError };
           }
           processedCodesRef.current.add(code);
@@ -206,33 +303,85 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   useEffect(() => {
     let isMounted = true;
+    authProviderMountedRef.current = true;
 
-    // Deterministic initial session retrieval
-    supabase.auth
-      .getSession()
-      .then(({ data: { session: initialSession }, error }) => {
+    // Do not expose restored sessions until both the session and recovery marker
+    // have been read successfully. A storage error is not equivalent to absence.
+    const initialAuthStateVersion = authStateVersionRef.current;
+    Promise.all([
+      supabase.auth.getSession(),
+      LargeSecureStoreAdapter.getItem(PASSWORD_RECOVERY_PENDING_KEY),
+    ])
+      .then(([{ data: { session: initialSession }, error }, recoveryMarker]) => {
         if (!isMounted) return;
-        if (error) {
-          setSession(null);
-        } else {
-          setSession(initialSession);
+        if (error || (recoveryMarker !== null && recoveryMarker !== 'true')) {
+          throw recoveryStorageAuthError();
         }
-        setLoading(false);
+
+        authInitializationResolvedRef.current = true;
+        if (authStateVersionRef.current === initialAuthStateVersion) {
+          setSession(initialSession);
+          if (recoveryMarker === 'true') {
+            passwordRecoveryRef.current = true;
+            setPasswordRecovery(true);
+            setAuthNavigationGate('password-recovery');
+          } else {
+            passwordRecoveryRef.current = false;
+            setPasswordRecovery(false);
+            setAuthNavigationGate('ready');
+          }
+        } else if (
+          recoveryMarker === 'true' &&
+          authNavigationGateRef.current !== 'ready'
+        ) {
+          passwordRecoveryRef.current = true;
+          setPasswordRecovery(true);
+          setAuthNavigationGate('password-recovery');
+        } else if (!passwordRecoveryRef.current && authNavigationGateRef.current === 'loading') {
+          setAuthNavigationGate('ready');
+        }
       })
       .catch(() => {
         if (isMounted) {
+          authInitializationResolvedRef.current = true;
           setSession(null);
-          setLoading(false);
+          setPasswordRecoveryPersistenceFailed(true);
+          setAuthNavigationGate('storage-error');
         }
       });
 
-    // Single active auth state change listener
+    // INITIAL_SESSION is emitted asynchronously by Supabase. Startup restoration
+    // above is authoritative because it checks the recovery marker alongside it.
     const {
       data: { subscription: authSubscription },
-    } = supabase.auth.onAuthStateChange((_event, currentSession) => {
-      if (isMounted) {
-        setSession(currentSession);
-        setLoading(false);
+    } = supabase.auth.onAuthStateChange((event, currentSession) => {
+      if (!isMounted || event === 'INITIAL_SESSION') return;
+
+      authStateVersionRef.current += 1;
+      if (
+        authNavigationGateRef.current === 'storage-error' &&
+        event !== 'PASSWORD_RECOVERY' &&
+        event !== 'SIGNED_OUT'
+      ) {
+        setSession(null);
+        return;
+      }
+      setSession(currentSession);
+      if (event === 'PASSWORD_RECOVERY') {
+        void setPasswordRecoveryPending(true).catch(() => {});
+      } else if (event === 'SIGNED_OUT') {
+        // Keep any recovery/storage gate until marker cleanup is confirmed.
+        if (!passwordRecoveryRef.current && authNavigationGateRef.current !== 'storage-error') {
+          setPasswordRecoveryPersistenceFailed(false);
+        }
+      } else if (
+        event === 'SIGNED_IN' &&
+        !passwordRecoveryRef.current &&
+        authNavigationGateRef.current !== 'storage-error' &&
+        authInitializationResolvedRef.current
+      ) {
+        setPasswordRecoveryPersistenceFailed(false);
+        setAuthNavigationGate('ready');
       }
     });
 
@@ -259,12 +408,102 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
     return () => {
       isMounted = false;
+      authProviderMountedRef.current = false;
       authSubscription.unsubscribe();
       if (linkingSubscription && typeof linkingSubscription.remove === 'function') {
         linkingSubscription.remove();
       }
     };
-  }, [processIncomingUrl]);
+  }, [processIncomingUrl, setAuthNavigationGate, setPasswordRecoveryPending]);
+
+  const signUpWithEmail = useCallback(async (email: string, password: string) => {
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: { emailRedirectTo: MOBILE_AUTH_CALLBACK_URL },
+    });
+    return { error, needsEmailVerification: !error && !data.session };
+  }, []);
+
+  const signInWithEmail = useCallback(async (email: string, password: string) => {
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    return { error };
+  }, []);
+
+  const requestPasswordReset = useCallback(async (email: string) => {
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: MOBILE_AUTH_CALLBACK_URL,
+    });
+    return { error };
+  }, []);
+
+  const clearLocalAuthState = useCallback(async () => {
+    try {
+      const { error } = await supabase.auth.signOut({ scope: 'local' });
+      if (error) throw error;
+      const markerRemoval = recoveryMarkerWriteRef.current
+        .catch(() => {})
+        .then(() => LargeSecureStoreAdapter.removeItem(PASSWORD_RECOVERY_PENDING_KEY));
+      recoveryMarkerWriteRef.current = markerRemoval;
+      await markerRemoval;
+      setSession(null);
+      passwordRecoveryRef.current = false;
+      setPasswordRecovery(false);
+      setPasswordRecoveryPersistenceFailed(false);
+      authInitializationResolvedRef.current = true;
+      setAuthNavigationGate('ready');
+      return { error: null };
+    } catch {
+      setPasswordRecoveryPersistenceFailed(true);
+      setSession(null);
+      setAuthNavigationGate('storage-error');
+      return { error: recoveryStorageAuthError() };
+    }
+  }, [setAuthNavigationGate]);
+
+  const signOut = useCallback(async () => {
+    try {
+      const { error } = await supabase.auth.signOut();
+      if (error) {
+        setPasswordRecoveryPersistenceFailed(true);
+        setSession(null);
+        setAuthNavigationGate('storage-error');
+        return { error };
+      }
+      await setPasswordRecoveryPending(false);
+      return { error: null };
+    } catch {
+      setPasswordRecoveryPersistenceFailed(true);
+      setSession(null);
+      setAuthNavigationGate('storage-error');
+      return { error: recoveryStorageAuthError() };
+    }
+  }, [setAuthNavigationGate, setPasswordRecoveryPending]);
+
+  const updatePassword = useCallback(async (password: string) => {
+    try {
+      await recoveryMarkerWriteRef.current;
+    } catch {
+      return { error: recoveryStorageAuthError() };
+    }
+
+    const { error } = await supabase.auth.updateUser({ password });
+    if (!error) {
+      try {
+        await setPasswordRecoveryPending(false);
+      } catch {
+        return { error: recoveryStorageAuthError() };
+      }
+    } else if (
+      error.name === 'AuthSessionMissingError' ||
+      error.status === 401 ||
+      error.status === 403
+    ) {
+      const signOutResult = await signOut();
+      if (signOutResult.error) return { error: signOutResult.error };
+    }
+    return { error };
+  }, [setPasswordRecoveryPending, signOut]);
 
   const signInWithGoogle = useCallback(async (): Promise<{
     error: Error | AuthError | null;
@@ -276,7 +515,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         scheme: 'islamicservices',
       });
 
-      console.log('[AuthContext] Initiating Google OAuth with redirect:', redirectUrl);
+      console.log('[AuthContext] Initiating Google OAuth');
       const { data, error } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
@@ -390,10 +629,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }
   }, [processIncomingUrl]);
 
-  const signOut = useCallback(async () => {
-    const { error } = await supabase.auth.signOut();
-    return { error };
-  }, []);
+
 
   const refreshSession = useCallback(async () => {
     const { data, error } = await supabase.auth.refreshSession();
@@ -406,12 +642,37 @@ export function AuthProvider({ children }: AuthProviderProps) {
     () => ({
       session,
       user,
+      authNavigationGate: authNavigationGateState,
+      authStorageFailure,
+      clearLocalAuthState,
       loading,
+      passwordRecovery,
+      passwordRecoveryPersistenceFailed,
       signInWithGoogle,
+      signUpWithEmail,
+      signInWithEmail,
+      requestPasswordReset,
+      updatePassword,
       signOut,
       refreshSession,
     }),
-    [session, user, loading, signInWithGoogle, signOut, refreshSession]
+    [
+      session,
+      user,
+      authNavigationGateState,
+      authStorageFailure,
+      clearLocalAuthState,
+      loading,
+      passwordRecovery,
+      passwordRecoveryPersistenceFailed,
+      signInWithGoogle,
+      signUpWithEmail,
+      signInWithEmail,
+      requestPasswordReset,
+      updatePassword,
+      signOut,
+      refreshSession,
+    ]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

@@ -91,8 +91,25 @@ $$;
 REVOKE EXECUTE ON FUNCTION public.check_request_status_update() FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.check_request_status_update() TO authenticated, service_role, postgres;
 
--- Explicitly revoke column-level UPDATE privilege on status from client roles
-REVOKE UPDATE (status) ON TABLE public.service_requests FROM authenticated, anon, PUBLIC;
+
+-- Requesters may revise only notes while their own request is REQUESTED.
+-- Revoke table and column ACLs first: REVOKE UPDATE ON TABLE does not clear
+-- any separately granted column privileges. The allowlist below intentionally
+-- excludes status, ownership, assignment, identity, and timestamp columns.
+REVOKE UPDATE ON TABLE public.service_requests FROM authenticated, anon, PUBLIC;
+REVOKE UPDATE (id, user_id, provider_id, service_id, location_id, status, event_date, notes, created_at, updated_at)
+  ON TABLE public.service_requests FROM authenticated, anon, PUBLIC;
+GRANT UPDATE (notes) ON TABLE public.service_requests TO authenticated;
+
+-- Column privileges limit which fields can be written; RLS separately limits
+-- which rows and row states can be written. WITH CHECK protects the new row.
+DROP POLICY IF EXISTS p_service_requests_update_requester ON public.service_requests;
+CREATE POLICY p_service_requests_update_requester
+  ON public.service_requests
+  FOR UPDATE
+  TO authenticated
+  USING (auth.uid() = user_id AND status = 'REQUESTED'::public.request_status)
+  WITH CHECK (auth.uid() = user_id AND status = 'REQUESTED'::public.request_status);
 
 
 -- ============================================================================
@@ -111,6 +128,31 @@ DECLARE
   req_status public.request_status;
   current_user_id uuid;
 BEGIN
+  -- Reject changes to immutable keys before using NEW values to look up the
+  -- parent request or validate participants. This makes the immutability
+  -- contract independent of whether the proposed replacement values exist.
+  IF TG_OP = 'UPDATE' THEN
+    IF NEW.id IS DISTINCT FROM OLD.id THEN
+      RAISE EXCEPTION 'Cannot modify id of an existing contact share';
+    END IF;
+
+    IF NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+      RAISE EXCEPTION 'Cannot modify created_at of an existing contact share';
+    END IF;
+
+    IF NEW.request_id IS DISTINCT FROM OLD.request_id THEN
+      RAISE EXCEPTION 'Cannot modify request_id of an existing contact share';
+    END IF;
+
+    IF NEW.sharer_id IS DISTINCT FROM OLD.sharer_id THEN
+      RAISE EXCEPTION 'Cannot modify sharer_id of an existing contact share';
+    END IF;
+
+    IF NEW.recipient_id IS DISTINCT FROM OLD.recipient_id THEN
+      RAISE EXCEPTION 'Cannot modify recipient_id of an existing contact share';
+    END IF;
+  END IF;
+
   -- 1. Fetch request participants and status
   SELECT sr.user_id, p.user_id, sr.status
   INTO req_user_id, prov_user_id, req_status
@@ -163,27 +205,6 @@ BEGIN
 
   -- 5. Enforce immutability and state transition rules on UPDATE
   IF TG_OP = 'UPDATE' THEN
-    -- Verify immutability of EVERY promised immutable column
-    IF NEW.id IS DISTINCT FROM OLD.id THEN
-      RAISE EXCEPTION 'Cannot modify id of an existing contact share';
-    END IF;
-
-    IF NEW.created_at IS DISTINCT FROM OLD.created_at THEN
-      RAISE EXCEPTION 'Cannot modify created_at of an existing contact share';
-    END IF;
-
-    IF NEW.request_id IS DISTINCT FROM OLD.request_id THEN
-      RAISE EXCEPTION 'Cannot modify request_id of an existing contact share';
-    END IF;
-
-    IF NEW.sharer_id IS DISTINCT FROM OLD.sharer_id THEN
-      RAISE EXCEPTION 'Cannot modify sharer_id of an existing contact share';
-    END IF;
-
-    IF NEW.recipient_id IS DISTINCT FROM OLD.recipient_id THEN
-      RAISE EXCEPTION 'Cannot modify recipient_id of an existing contact share';
-    END IF;
-
     IF NEW.status <> OLD.status THEN
       IF current_user_id IS NOT NULL THEN
         -- Recipient confirmation required to transition to 'shared'

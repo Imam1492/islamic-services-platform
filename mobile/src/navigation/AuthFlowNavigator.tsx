@@ -94,9 +94,9 @@ function AuthenticatedFlow({ userId }: { userId: string }) {
 }
 
 export function AuthFlowNavigator() {
-  const { session, loading } = useAuth();
+  const { session, authNavigationGate } = useAuth();
 
-  if (loading) {
+  if (authNavigationGate === 'loading') {
     return (
       <View style={styles.loadingContainer} testID="auth-loading-container">
         <ActivityIndicator
@@ -107,6 +107,14 @@ export function AuthFlowNavigator() {
         <Text style={styles.loadingText}>Initializing session...</Text>
       </View>
     );
+  }
+
+  if (authNavigationGate === 'storage-error') {
+    return <LoginScreen authStorageFailureMode />;
+  }
+
+  if (authNavigationGate === 'password-recovery') {
+    return <LoginScreen passwordRecoveryMode />;
   }
 
   // Authoritative authenticated session check

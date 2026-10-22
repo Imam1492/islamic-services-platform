@@ -8,6 +8,14 @@ import type {
   PublicProviderProfile,
 } from '../src/types/discovery';
 
+jest.mock('../src/lib/secureStorage', () => ({
+  LargeSecureStoreAdapter: {
+    getItem: jest.fn().mockResolvedValue(null),
+    setItem: jest.fn().mockResolvedValue(undefined),
+    removeItem: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
 jest.mock('../src/services/discoveryService');
 
 describe('useProviderDiscovery & usePublicProviderProfile Hook Concurrency Suite', () => {

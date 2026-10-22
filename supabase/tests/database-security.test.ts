@@ -14,6 +14,10 @@ import { Client } from 'pg';
 import * as jwtLib from 'jsonwebtoken';
 const jwt: typeof import('jsonwebtoken') = (jwtLib as any).default ?? jwtLib;
 import { randomUUID } from 'crypto';
+import {
+  resolveLocalDatabaseTestUrl,
+  shouldRunDatabaseIntegrationTests,
+} from './database-test-guard';
 
 // Types & Config
 interface TestUser {
@@ -40,7 +44,9 @@ interface FixtureData {
   provider1ProfileId: string;
 }
 
-const DB_URL = process.env.DATABASE_URL || 'postgresql://postgres:postgres@127.0.0.1:54322/postgres';
+const DB_URL = resolveLocalDatabaseTestUrl();
+const runDatabaseTests = shouldRunDatabaseIntegrationTests();
+const databaseDescribe = runDatabaseTests ? describe : describe.skip;
 const JWT_SECRET = process.env.SUPABASE_JWT_SECRET || 'super-secret-jwt-token-with-at-least-32-characters-long';
 
 // Helper to generate Supabase-compatible JWT
@@ -59,10 +65,42 @@ function generateSupabaseJwt(userId: string, role: string = 'authenticated'): st
   );
 }
 
-describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Suite', () => {
+databaseDescribe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Suite', () => {
   let isDbConnected = false;
   let adminClient: Client;
   let fixtures: FixtureData;
+  const runId = randomUUID();
+  const rootUserIds = Array.from({ length: 5 }, () => randomUUID());
+  const additionalUserIds: string[] = [];
+
+  function uniqueTestPhone(): string {
+    const digits = BigInt(`0x${randomUUID().replace(/-/g, '')}`).toString().slice(0, 13).padStart(13, '0');
+    return `+1${digits}`;
+  }
+
+  async function removeUserFixturesIfUnreferenced(userIds: string[]): Promise<void> {
+    if (!userIds.length) return;
+    await adminClient.query(`DELETE FROM public.user_roles WHERE user_id = ANY($1::uuid[]);`, [userIds]);
+    await adminClient.query(`DELETE FROM public.user_private WHERE user_id = ANY($1::uuid[]);`, [userIds]);
+    await adminClient.query(`DELETE FROM public.users u WHERE u.id = ANY($1::uuid[])
+      AND NOT EXISTS (SELECT 1 FROM public.audit_logs a WHERE a.actor_id = u.id)
+      AND NOT EXISTS (SELECT 1 FROM public.user_consents c WHERE c.user_id = u.id)
+      AND NOT EXISTS (SELECT 1 FROM public.service_requests r WHERE r.user_id = u.id)
+      AND NOT EXISTS (SELECT 1 FROM public.conversations c WHERE c.user_id = u.id)
+      AND NOT EXISTS (SELECT 1 FROM public.messages m WHERE m.sender_id = u.id)
+      AND NOT EXISTS (SELECT 1 FROM public.contact_shares s WHERE s.sharer_id = u.id OR s.recipient_id = u.id)
+      AND NOT EXISTS (SELECT 1 FROM public.provider_profiles p WHERE p.user_id = u.id)
+      AND NOT EXISTS (SELECT 1 FROM public.admin_area_assignments a WHERE a.user_id = u.id);`, [userIds]);
+    await adminClient.query(`DELETE FROM auth.users au WHERE au.id = ANY($1::uuid[])
+      AND NOT EXISTS (SELECT 1 FROM public.audit_logs a WHERE a.actor_id = au.id)
+      AND NOT EXISTS (SELECT 1 FROM public.user_consents c WHERE c.user_id = au.id)
+      AND NOT EXISTS (SELECT 1 FROM public.service_requests r WHERE r.user_id = au.id)
+      AND NOT EXISTS (SELECT 1 FROM public.conversations c WHERE c.user_id = au.id)
+      AND NOT EXISTS (SELECT 1 FROM public.messages m WHERE m.sender_id = au.id)
+      AND NOT EXISTS (SELECT 1 FROM public.contact_shares s WHERE s.sharer_id = au.id OR s.recipient_id = au.id)
+      AND NOT EXISTS (SELECT 1 FROM public.provider_profiles p WHERE p.user_id = au.id)
+      AND NOT EXISTS (SELECT 1 FROM public.admin_area_assignments a WHERE a.user_id = au.id);`, [userIds]);
+  }
 
   // Connect helper to create an authenticated client session mimicking PostgREST RLS
   async function createAuthClient(tokenUser: TestUser): Promise<Client> {
@@ -80,35 +118,22 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     try {
       await adminClient.connect();
       isDbConnected = true;
-    } catch (err: any) {
-      // In CI, missing database connection MUST fail the test suite to prevent false positives
+    } catch {
       isDbConnected = false;
-      if (process.env.CI === 'true') {
-        throw new Error(
-          'Database connection required in CI environment; security tests cannot run.'
-        );
-      }
-      console.warn(
-        '[WARN] PostgreSQL database connection unavailable on ' +
-          DB_URL +
-          '. Skipping live integration tests in local sandbox. (CI=true will enforce connection).'
+      throw new Error(
+        'Database integration tests were enabled, but the approved local PostgreSQL target could not be reached (127.0.0.1:54322/postgres).'
       );
-      return;
     }
 
     // Set up test fixtures using privileged admin/service connection
-    const uAId = '11111111-1111-4111-8111-111111111111';
-    const uBId = '22222222-2222-4222-8222-222222222222';
-    const p1Id = '33333333-3333-4333-8333-333333333333';
-    const aAdminId = '44444444-4444-4444-8444-444444444444';
-    const sAdminId = '55555555-5555-4555-8555-555555555555';
+    const [uAId, uBId, p1Id, aAdminId, sAdminId] = rootUserIds;
 
     fixtures = {
-      userA: { id: uAId, name: 'User A', phone: '+12025550101', token: generateSupabaseJwt(uAId) },
-      userB: { id: uBId, name: 'User B', phone: '+12025550102', token: generateSupabaseJwt(uBId) },
-      provider1: { id: p1Id, name: 'Provider 1', phone: '+12025550103', role: 'provider', token: generateSupabaseJwt(p1Id) },
-      areaAdmin: { id: aAdminId, name: 'Area Admin', phone: '+12025550104', role: 'area_admin', token: generateSupabaseJwt(aAdminId) },
-      superAdmin: { id: sAdminId, name: 'Super Admin', phone: '+12025550105', role: 'super_admin', token: generateSupabaseJwt(sAdminId) },
+      userA: { id: uAId, name: 'User A', phone: uniqueTestPhone(), token: generateSupabaseJwt(uAId) },
+      userB: { id: uBId, name: 'User B', phone: uniqueTestPhone(), token: generateSupabaseJwt(uBId) },
+      provider1: { id: p1Id, name: 'Provider 1', phone: uniqueTestPhone(), role: 'provider', token: generateSupabaseJwt(p1Id) },
+      areaAdmin: { id: aAdminId, name: 'Area Admin', phone: uniqueTestPhone(), role: 'area_admin', token: generateSupabaseJwt(aAdminId) },
+      superAdmin: { id: sAdminId, name: 'Super Admin', phone: uniqueTestPhone(), role: 'super_admin', token: generateSupabaseJwt(sAdminId) },
       countryId: '',
       stateId: '',
       cityId: '',
@@ -119,28 +144,12 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
       provider1ProfileId: '',
     };
 
-    // Clean any prior fixture data
-    await adminClient.query(`DELETE FROM public.audit_logs WHERE actor_id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
-    await adminClient.query(`DELETE FROM public.contact_shares WHERE sharer_id IN ($1, $2, $3, $4, $5) OR recipient_id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
-    await adminClient.query(`DELETE FROM public.conversations WHERE user_id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
-    await adminClient.query(`DELETE FROM public.service_requests WHERE user_id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
-    await adminClient.query(`DELETE FROM public.provider_locations WHERE provider_id IN (SELECT id FROM public.provider_profiles WHERE user_id = $1);`, [p1Id]);
-    await adminClient.query(`DELETE FROM public.provider_profiles WHERE user_id = $1;`, [p1Id]);
-    await adminClient.query(`DELETE FROM public.admin_area_assignments WHERE user_id = $1;`, [aAdminId]);
-    await adminClient.query(`DELETE FROM public.user_roles WHERE user_id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
-    await adminClient.query(`DELETE FROM public.user_private WHERE user_id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
-    await adminClient.query(`DELETE FROM public.users WHERE id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
-    await adminClient.query(`DELETE FROM auth.users WHERE id IN ($1, $2, $3, $4, $5);`, [uAId, uBId, p1Id, aAdminId, sAdminId]);
-
-    // Insert Auth Users FIRST: existing production triggers (on_auth_user_created -> public.handle_new_auth_user())
-    // will provision public.users, public.user_roles (default 'user'), and public.user_private (phone_e164).
+    // Insert isolated auth fixtures without pre-cleaning shared IDs or immutable audit rows.
     for (const u of [fixtures.userA, fixtures.userB, fixtures.provider1, fixtures.areaAdmin, fixtures.superAdmin]) {
-      const email = `${u.name.toLowerCase().replace(/\s+/g, '')}@example.com`;
+      const email = `${u.id}@example.test`;
       await adminClient.query(
         `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
-         VALUES ($1, $2, $3, $4::jsonb)
-         ON CONFLICT (id) DO UPDATE
-         SET email = $2, phone = $3, raw_user_meta_data = $4::jsonb;`,
+         VALUES ($1, $2, $3, $4::jsonb);`,
         [u.id, email, u.phone, JSON.stringify({ full_name: u.name })]
       );
     }
@@ -188,13 +197,14 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
 
     // Category & Service
     const catRes = await adminClient.query(
-      `INSERT INTO public.categories (name, slug) VALUES ('Test Category', 'test-category') ON CONFLICT (slug) DO UPDATE SET name = 'Test Category' RETURNING id;`
+      `INSERT INTO public.categories (name, slug) VALUES ($1, $2) RETURNING id;`,
+      [`Test Category ${runId}`, `test-category-${runId}`]
     );
     fixtures.categoryId = catRes.rows[0].id;
 
     const srvRes = await adminClient.query(
-      `INSERT INTO public.services (category_id, name, slug) VALUES ($1, 'Test Service', 'test-service') ON CONFLICT (slug) DO UPDATE SET name = 'Test Service' RETURNING id;`,
-      [fixtures.categoryId]
+      `INSERT INTO public.services (category_id, name, slug) VALUES ($1, 'Test Service', $2) RETURNING id;`,
+      [fixtures.categoryId, `test-service-${runId}`]
     );
     fixtures.serviceId = srvRes.rows[0].id;
 
@@ -214,7 +224,38 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
 
   afterAll(async () => {
     if (adminClient && isDbConnected) {
-      await adminClient.end();
+      try {
+        await adminClient.query(`DELETE FROM public.contact_shares
+          WHERE sharer_id = ANY($1::uuid[]) OR recipient_id = ANY($1::uuid[])
+             OR request_id IN (SELECT id FROM public.service_requests WHERE user_id = ANY($1::uuid[]));`, [rootUserIds]);
+        await adminClient.query(`DELETE FROM public.conversations c
+          WHERE (c.user_id = ANY($1::uuid[])
+             OR c.request_id IN (SELECT id FROM public.service_requests WHERE user_id = ANY($1::uuid[])))
+            AND NOT EXISTS (SELECT 1 FROM public.messages m WHERE m.conversation_id = c.id);`, [rootUserIds]);
+        await adminClient.query(`DELETE FROM public.service_requests r
+          WHERE (r.user_id = ANY($1::uuid[]) OR r.provider_id = $2)
+            AND NOT EXISTS (SELECT 1 FROM public.conversations c WHERE c.request_id = r.id);`, [rootUserIds, fixtures?.provider1ProfileId || null]);
+        await adminClient.query(`DELETE FROM public.admin_area_assignments WHERE user_id = ANY($1::uuid[]);`, [rootUserIds]);
+        if (fixtures?.provider1ProfileId) {
+          const providerRequestRes = await adminClient.query(`SELECT 1 FROM public.service_requests WHERE provider_id = $1 LIMIT 1;`, [fixtures.provider1ProfileId]);
+          if (providerRequestRes.rowCount === 0) {
+          await adminClient.query(`DELETE FROM public.provider_locations WHERE provider_id = $1;`, [fixtures.provider1ProfileId]);
+          await adminClient.query(`DELETE FROM public.provider_profiles WHERE id = $1;`, [fixtures.provider1ProfileId]);
+          }
+        }
+        await removeUserFixturesIfUnreferenced(rootUserIds);
+        await removeUserFixturesIfUnreferenced(additionalUserIds);
+        if (fixtures?.serviceId) await adminClient.query(`DELETE FROM public.services WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM public.service_requests WHERE service_id = $1);`, [fixtures.serviceId]);
+        if (fixtures?.categoryId) await adminClient.query(`DELETE FROM public.categories WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM public.services WHERE category_id = $1);`, [fixtures.categoryId]);
+        const locationIds = [fixtures?.areaAId, fixtures?.areaBId, fixtures?.cityId, fixtures?.stateId, fixtures?.countryId].filter(Boolean);
+        for (const locationId of locationIds) {
+          await adminClient.query(`DELETE FROM public.locations WHERE id = $1
+            AND NOT EXISTS (SELECT 1 FROM public.service_requests WHERE location_id = $1)
+            AND NOT EXISTS (SELECT 1 FROM public.locations WHERE parent_id = $1);`, [locationId]);
+        }
+      } finally {
+        await adminClient.end();
+      }
     }
   });
 
@@ -241,10 +282,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
 
   describe('Mandatory Negative Tests', () => {
     test('NEG-01: User A cannot SELECT User B row from user_private (phone never exposed)', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       try {
         const res = await clientA.query(`SELECT * FROM public.user_private WHERE user_id = $1;`, [fixtures.userB.id]);
@@ -255,10 +293,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('NEG-02: Authenticated client cannot INSERT directly into audit_logs', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       try {
         await expect(
@@ -273,10 +308,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('NEG-03: Area Admin for Area A cannot verify provider or perform admin operation in Area B', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientAdmin = await createAuthClient(fixtures.areaAdmin);
       try {
         // Attempting to insert a verification targeting Area B
@@ -293,10 +325,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('NEG-04: Authenticated client cannot directly UPDATE service_requests.status', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       try {
         // Create a legitimate request first
@@ -321,10 +350,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('NEG-05: Concurrency race condition protection on conflicting transitions (FOR UPDATE)', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       const clientP = await createAuthClient(fixtures.provider1);
 
@@ -359,10 +385,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('NEG-06: User B cannot INSERT messages into User A conversation & sender spoofing blocked', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       const clientB = await createAuthClient(fixtures.userB);
       const clientP = await createAuthClient(fixtures.provider1);
@@ -403,10 +426,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('NEG-07: Cannot retrieve contact info before explicit contact-sharing consent', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       const clientP = await createAuthClient(fixtures.provider1);
 
@@ -430,10 +450,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('NEG-08 & NEG-09: Non-participant cannot read conversations or messages', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       const clientB = await createAuthClient(fixtures.userB);
       const clientP = await createAuthClient(fixtures.provider1);
@@ -462,10 +479,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('NEG-10: Wrong recipient cannot approve or confirm a contact share', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       const clientB = await createAuthClient(fixtures.userB);
       const clientP = await createAuthClient(fixtures.provider1);
@@ -495,10 +509,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('NEG-11: Contact info inaccessible after share is revoked', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       const clientP = await createAuthClient(fixtures.provider1);
 
@@ -530,10 +541,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('NEG-12: Provider cannot accept request in undeclared Area (SEC-24-01)', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       const clientP = await createAuthClient(fixtures.provider1);
 
@@ -562,10 +570,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('NEG-13: Area Admin cannot block/transition requests outside assigned Area', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       const clientAdmin = await createAuthClient(fixtures.areaAdmin);
 
@@ -588,10 +593,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('NEG-14: Anonymous / unauthenticated caller cannot invoke transition RPC', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const anonClient = new Client({ connectionString: DB_URL });
       await anonClient.connect();
       try {
@@ -605,10 +607,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('NEG-15: Authenticated client cannot mutate provider_badges directly', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientP = await createAuthClient(fixtures.provider1);
       try {
         await expect(
@@ -632,10 +631,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     let shareId: string;
 
     test('POS-01: User A creates legitimate service request in declared Area A', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       try {
         const res = await clientA.query(
@@ -651,11 +647,57 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
       }
     });
 
-    test('POS-02: Assigned approved provider legitimately accepts request', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
+    test('POS-01a: Requester can update notes while request is still REQUESTED', async () => {
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
+      const clientA = await createAuthClient(fixtures.userA);
+      const clientB = await createAuthClient(fixtures.userB);
+      try {
+        const privilegeRes = await adminClient.query(`
+          SELECT
+            has_table_privilege('authenticated', 'public.service_requests', 'UPDATE') AS table_update,
+            has_column_privilege('authenticated', 'public.service_requests', 'notes', 'UPDATE') AS notes_update,
+            has_column_privilege('authenticated', 'public.service_requests', 'status', 'UPDATE') AS status_update,
+            has_column_privilege('authenticated', 'public.service_requests', 'user_id', 'UPDATE') AS owner_update,
+            has_column_privilege('authenticated', 'public.service_requests', 'event_date', 'UPDATE') AS event_date_update;
+        `);
+        expect(privilegeRes.rows[0]).toEqual({
+          table_update: false,
+          notes_update: true,
+          status_update: false,
+          owner_update: false,
+          event_date_update: false,
+        });
+
+        const res = await clientA.query(
+          `UPDATE public.service_requests
+           SET notes = 'Updated requester notes'
+           WHERE id = $1
+           RETURNING notes, status;`,
+          [activeReqId]
+        );
+        expect(res.rows).toHaveLength(1);
+        expect(res.rows[0]).toEqual({ notes: 'Updated requester notes', status: 'REQUESTED' });
+
+        await expect(
+          clientA.query(`UPDATE public.service_requests SET user_id = $2 WHERE id = $1;`, [activeReqId, fixtures.userB.id])
+        ).rejects.toMatchObject({ code: '42501' });
+        await expect(
+          clientA.query(`UPDATE public.service_requests SET event_date = now() WHERE id = $1;`, [activeReqId])
+        ).rejects.toMatchObject({ code: '42501' });
+
+        const otherUserRes = await clientB.query(
+          `UPDATE public.service_requests SET notes = 'Unauthorized note' WHERE id = $1 RETURNING id;`,
+          [activeReqId]
+        );
+        expect(otherUserRes.rows).toHaveLength(0);
+      } finally {
+        await clientA.end();
+        await clientB.end();
       }
+    });
+
+    test('POS-02: Assigned approved provider legitimately accepts request', async () => {
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientP = await createAuthClient(fixtures.provider1);
       try {
         const res = await clientP.query(
@@ -668,11 +710,22 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
       }
     });
 
-    test('POS-03: Participant activates chat', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
+    test('POS-02a: Requester cannot revise notes after the request leaves REQUESTED', async () => {
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
+      const clientA = await createAuthClient(fixtures.userA);
+      try {
+        const res = await clientA.query(
+          `UPDATE public.service_requests SET notes = 'Late note edit' WHERE id = $1 RETURNING id;`,
+          [activeReqId]
+        );
+        expect(res.rows).toHaveLength(0);
+      } finally {
+        await clientA.end();
       }
+    });
+
+    test('POS-03: Participant activates chat', async () => {
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       try {
         const res = await clientA.query(`SELECT public.activate_request_chat($1) as out;`, [activeReqId]);
@@ -683,10 +736,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('POS-04: Legitimate participant sends a message in active chat (customer and provider)', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       const clientP = await createAuthClient(fixtures.provider1);
       try {
@@ -720,10 +770,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('POS-05: Legitimate sharer initiates contact share request', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       try {
         const res = await clientA.query(`SELECT public.request_contact_share($1) as out;`, [activeReqId]);
@@ -735,10 +782,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('POS-06: Designated recipient explicitly confirms contact share', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientP = await createAuthClient(fixtures.provider1);
       try {
         const res = await clientP.query(`SELECT public.respond_contact_share($1, true) as out;`, [shareId]);
@@ -749,10 +793,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('POS-07: Authorized recipient retrieves shared contact info (and privacy verified)', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientP = await createAuthClient(fixtures.provider1);
       try {
         const res = await clientP.query(`SELECT public.get_shared_contact_info($1, $2) as out;`, [
@@ -773,10 +814,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
 
   describe('Audit Log Immutability & Privacy', () => {
     test('State transitions record audit events without leaking PII or message content', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       // Inspect audit records using privileged connection
       const auditRes = await adminClient.query(
         `SELECT action, old_data, new_data FROM public.audit_logs WHERE entity_type = 'service_requests' ORDER BY id DESC LIMIT 5;`
@@ -790,10 +828,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('Audit logs cannot be updated or deleted even by super admin session role', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientSAdmin = await createAuthClient(fixtures.superAdmin);
       try {
         await expect(clientSAdmin.query(`DELETE FROM public.audit_logs;`)).rejects.toThrow();
@@ -809,11 +844,10 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
   // ==========================================================================
 
   describe('Phase 3.1: F-02 Authoritative Identity & Phone Synchronization Tests', () => {
+    const syncedUserId = randomUUID();
+    const nullPhoneUserId = randomUUID();
     test('F02-NEG-01: Authenticated User A cannot directly INSERT an arbitrary phone_e164 into user_private', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       try {
         await expect(
@@ -828,10 +862,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('F02-NEG-02: Authenticated User A cannot directly UPDATE their phone_e164 to an arbitrary value', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       try {
         await expect(
@@ -846,10 +877,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('F02-NEG-03: Authenticated User A cannot modify User B phone_e164 or private record', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       try {
         const res = await clientA.query(
@@ -870,10 +898,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('F02-NEG-04: Authenticated client cannot invoke synchronization function with arbitrary arguments', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       try {
         await expect(
@@ -885,10 +910,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('F02-NEG-05: Existing user_private privacy boundary remains intact (User A cannot SELECT User B phone)', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       try {
         const res = await clientA.query(
@@ -902,24 +924,16 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('F02-POS-01 & POS-02: Valid auth.users creation synchronizes public.users and authoritative phone_e164', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
-      const testUserId = '77777777-7777-4777-8777-777777777777';
-      const testPhone = '+12025550188';
-
-      // Clean up fixture if pre-existing
-      await adminClient.query(`DELETE FROM public.user_roles WHERE user_id = $1;`, [testUserId]);
-      await adminClient.query(`DELETE FROM public.user_private WHERE user_id = $1;`, [testUserId]);
-      await adminClient.query(`DELETE FROM public.users WHERE id = $1;`, [testUserId]);
-      await adminClient.query(`DELETE FROM auth.users WHERE id = $1;`, [testUserId]);
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
+      const testUserId = syncedUserId;
+      const testPhone = uniqueTestPhone();
+      additionalUserIds.push(testUserId);
 
       // Insert simulated auth.users record
       await adminClient.query(
         `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
-         VALUES ($1, 'f02test@example.com', $2, '{"full_name": "F02 Test User"}'::jsonb);`,
-        [testUserId, testPhone]
+         VALUES ($1, $3, $2, '{"full_name": "F02 Test User"}'::jsonb);`,
+        [testUserId, testPhone, `${testUserId}@example.test`]
       );
 
       // Verify public.users row
@@ -949,12 +963,9 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('F02-POS-03: Legitimate auth.users phone update synchronizes authoritatively', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
-      const testUserId = '77777777-7777-4777-8777-777777777777';
-      const updatedPhone = '+12025550189';
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
+      const testUserId = syncedUserId;
+      const updatedPhone = uniqueTestPhone();
 
       await adminClient.query(
         `UPDATE auth.users SET phone = $1 WHERE id = $2;`,
@@ -970,22 +981,13 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('F02-POS-04: Legitimate NULL phone state in auth.users is handled safely', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
-      const nullPhoneUserId = '88888888-8888-4888-8888-888888888888';
-
-      // Clean up fixture if pre-existing
-      await adminClient.query(`DELETE FROM public.user_roles WHERE user_id = $1;`, [nullPhoneUserId]);
-      await adminClient.query(`DELETE FROM public.user_private WHERE user_id = $1;`, [nullPhoneUserId]);
-      await adminClient.query(`DELETE FROM public.users WHERE id = $1;`, [nullPhoneUserId]);
-      await adminClient.query(`DELETE FROM auth.users WHERE id = $1;`, [nullPhoneUserId]);
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
+      additionalUserIds.push(nullPhoneUserId);
 
       await adminClient.query(
         `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
-         VALUES ($1, 'nullphone@example.com', NULL, '{"full_name": "Null Phone User"}'::jsonb);`,
-        [nullPhoneUserId]
+         VALUES ($1, $2, NULL, '{"full_name": "Null Phone User"}'::jsonb);`,
+        [nullPhoneUserId, `${nullPhoneUserId}@example.test`]
       );
 
       const userRes = await adminClient.query(
@@ -1008,7 +1010,8 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
   // ==========================================================================
 
   describe('Phase 3.1: Provider Catalog Discovery & Participant Authorization Tests', () => {
-    const pendingProvUserId = '77777777-7777-4777-7777-777777777777';
+    const pendingProvUserId = randomUUID();
+    const pendingProvPhone = uniqueTestPhone();
     let pendingProvProfileId: string;
     let testReqId: string | null = null;
     let testConvId: string | null = null;
@@ -1016,16 +1019,12 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     beforeAll(async () => {
       if (!isDbConnected || !adminClient) return;
 
-      await adminClient.query(`DELETE FROM public.provider_profiles WHERE user_id = $1;`, [pendingProvUserId]);
-      await adminClient.query(`DELETE FROM public.user_roles WHERE user_id = $1;`, [pendingProvUserId]);
-      await adminClient.query(`DELETE FROM public.user_private WHERE user_id = $1;`, [pendingProvUserId]);
-      await adminClient.query(`DELETE FROM public.users WHERE id = $1;`, [pendingProvUserId]);
-      await adminClient.query(`DELETE FROM auth.users WHERE id = $1;`, [pendingProvUserId]);
+      additionalUserIds.push(pendingProvUserId);
 
       await adminClient.query(
         `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
-         VALUES ($1, 'pendingprov@example.com', '+15557777777', '{"full_name": "Pending Provider"}'::jsonb);`,
-        [pendingProvUserId]
+         VALUES ($1, $2, $3, '{"full_name": "Pending Provider"}'::jsonb);`,
+        [pendingProvUserId, `${pendingProvUserId}@example.test`, pendingProvPhone]
       );
       await adminClient.query(
         `INSERT INTO public.user_roles (user_id, role) VALUES ($1, 'provider');`,
@@ -1081,15 +1080,11 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
       await adminClient.query(`DELETE FROM public.provider_profiles WHERE user_id = $1;`, [pendingProvUserId]);
       await adminClient.query(`DELETE FROM public.user_roles WHERE user_id = $1;`, [pendingProvUserId]);
       await adminClient.query(`DELETE FROM public.user_private WHERE user_id = $1;`, [pendingProvUserId]);
-      await adminClient.query(`DELETE FROM public.users WHERE id = $1;`, [pendingProvUserId]);
-      await adminClient.query(`DELETE FROM auth.users WHERE id = $1;`, [pendingProvUserId]);
+      await removeUserFixturesIfUnreferenced([pendingProvUserId]);
     });
 
     test('PROV-POS-01: Approved provider profile is visible to authenticated User A for catalog discovery', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       try {
         const res = await clientA.query(
@@ -1104,10 +1099,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('PROV-NEG-01: Pending/unapproved provider profile is NOT visible to authenticated User A', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(fixtures.userA);
       try {
         const res = await clientA.query(
@@ -1121,14 +1113,11 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('PROV-POS-02: Pending provider can view their own profile via self-access RLS policy', async () => {
-      if (!isDbConnected) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const pendingProvUser: TestUser = {
         id: pendingProvUserId,
         name: 'Pending Provider',
-        phone: '+15557777777',
+        phone: pendingProvPhone,
         token: generateSupabaseJwt(pendingProvUserId, 'authenticated')
       };
       const clientPendingProv = await createAuthClient(pendingProvUser);
@@ -1145,10 +1134,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('PROV-POS-03: Participant validation helper accurately verifies membership and rejects arbitrary parameter probing', async () => {
-      if (!isDbConnected || !testConvId) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected || !testConvId) throw new Error('Database integration test did not receive its verified fixture context.');
       const clientA = await createAuthClient(fixtures.userA);
       const clientB = await createAuthClient(fixtures.userB);
       const clientP = await createAuthClient(fixtures.provider1);
@@ -1195,21 +1181,14 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('PROV-ADM-01: Area Admin A can access unapproved provider in Area A, but NOT in Area B or without declared area', async () => {
-      if (!isDbConnected || !adminClient) {
-        expect(true).toBe(true);
-        return;
-      }
+      if (!isDbConnected || !adminClient) throw new Error('Database integration test did not receive its verified local client.');
 
       // Create provider in Area A (pending)
-      const pAUser = '88888888-8888-4888-8888-888888888888';
-      await adminClient.query(`DELETE FROM public.provider_profiles WHERE user_id = $1;`, [pAUser]);
-      await adminClient.query(`DELETE FROM public.user_roles WHERE user_id = $1;`, [pAUser]);
-      await adminClient.query(`DELETE FROM public.user_private WHERE user_id = $1;`, [pAUser]);
-      await adminClient.query(`DELETE FROM public.users WHERE id = $1;`, [pAUser]);
-      await adminClient.query(`DELETE FROM auth.users WHERE id = $1;`, [pAUser]);
+      const pAUser = randomUUID();
+      additionalUserIds.push(pAUser);
       await adminClient.query(
-        `INSERT INTO auth.users (id, email, phone, raw_user_meta_data) VALUES ($1, 'prov_a@example.com', '+15558888888', '{"full_name": "Prov A"}'::jsonb);`,
-        [pAUser]
+        `INSERT INTO auth.users (id, email, phone, raw_user_meta_data) VALUES ($1, $2, $3, '{"full_name": "Prov A"}'::jsonb);`,
+        [pAUser, `${pAUser}@example.test`, uniqueTestPhone()]
       );
       await adminClient.query(`INSERT INTO public.user_roles (user_id, role) VALUES ($1, 'provider');`, [pAUser]);
       const pARes = await adminClient.query(
@@ -1220,15 +1199,11 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
       await adminClient.query(`INSERT INTO public.provider_locations (provider_id, location_id) VALUES ($1, $2);`, [pAProfileId, fixtures.areaAId]);
 
       // Create provider in Area B (pending)
-      const pBUser = '99999999-9999-4999-9999-999999999999';
-      await adminClient.query(`DELETE FROM public.provider_profiles WHERE user_id = $1;`, [pBUser]);
-      await adminClient.query(`DELETE FROM public.user_roles WHERE user_id = $1;`, [pBUser]);
-      await adminClient.query(`DELETE FROM public.user_private WHERE user_id = $1;`, [pBUser]);
-      await adminClient.query(`DELETE FROM public.users WHERE id = $1;`, [pBUser]);
-      await adminClient.query(`DELETE FROM auth.users WHERE id = $1;`, [pBUser]);
+      const pBUser = randomUUID();
+      additionalUserIds.push(pBUser);
       await adminClient.query(
-        `INSERT INTO auth.users (id, email, phone, raw_user_meta_data) VALUES ($1, 'prov_b@example.com', '+15559999999', '{"full_name": "Prov B"}'::jsonb);`,
-        [pBUser]
+        `INSERT INTO auth.users (id, email, phone, raw_user_meta_data) VALUES ($1, $2, $3, '{"full_name": "Prov B"}'::jsonb);`,
+        [pBUser, `${pBUser}@example.test`, uniqueTestPhone()]
       );
       await adminClient.query(`INSERT INTO public.user_roles (user_id, role) VALUES ($1, 'provider');`, [pBUser]);
       const pBRes = await adminClient.query(
@@ -1323,8 +1298,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
         await adminClient.query(`DELETE FROM public.provider_profiles WHERE user_id IN ($1, $2);`, [pAUser, pBUser]);
         await adminClient.query(`DELETE FROM public.user_roles WHERE user_id IN ($1, $2);`, [pAUser, pBUser]);
         await adminClient.query(`DELETE FROM public.user_private WHERE user_id IN ($1, $2);`, [pAUser, pBUser]);
-        await adminClient.query(`DELETE FROM public.users WHERE id IN ($1, $2);`, [pAUser, pBUser]);
-        await adminClient.query(`DELETE FROM auth.users WHERE id IN ($1, $2);`, [pAUser, pBUser]);
+        await removeUserFixturesIfUnreferenced([pAUser, pBUser]);
       }
     });
   });
@@ -1340,16 +1314,17 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     const obUser3Id = randomUUID();
 
     const testUsers = [
-      { id: obUser1Id, name: 'User', phone: '+12025550201', token: generateSupabaseJwt(obUser1Id) },
-      { id: obUser2Id, name: 'User', phone: '+12025550202', token: generateSupabaseJwt(obUser2Id) },
-      { id: obUser3Id, name: 'User', phone: '+12025550203', token: generateSupabaseJwt(obUser3Id) },
+      { id: obUser1Id, name: 'User', phone: uniqueTestPhone(), token: generateSupabaseJwt(obUser1Id) },
+      { id: obUser2Id, name: 'User', phone: uniqueTestPhone(), token: generateSupabaseJwt(obUser2Id) },
+      { id: obUser3Id, name: 'User', phone: uniqueTestPhone(), token: generateSupabaseJwt(obUser3Id) },
     ];
 
     beforeAll(async () => {
-      if (!isDbConnected) return;
+      if (!isDbConnected) throw new Error('Database integration setup ran without a verified local connection.');
 
       // Provision simulated fresh users who just completed phone OTP (name defaults to 'User', onboarded_at is NULL)
       for (const u of testUsers) {
+        additionalUserIds.push(u.id);
         await adminClient.query(
           `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
            VALUES ($1, $2, $3, '{}'::jsonb);`,
@@ -1367,7 +1342,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('ONBOARD-NEG-01: Anonymous / unauthenticated caller cannot execute complete_user_onboarding', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const anonClient = new Client({ connectionString: DB_URL });
       await anonClient.connect();
       try {
@@ -1381,7 +1356,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('ONBOARD-NEG-02: RPC signature has no user_id parameter (derived strictly from auth.uid())', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const paramCheck = await adminClient.query(`
         SELECT parameter_name, data_type
         FROM information_schema.parameters
@@ -1396,7 +1371,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('ONBOARD-NEG-03: Invalid, empty, or whitespace full name is rejected', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUsers[0]);
       try {
         // Empty
@@ -1425,7 +1400,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('ONBOARD-NEG-04: Empty or whitespace document versions are rejected', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUsers[0]);
       try {
         // Empty tos
@@ -1453,7 +1428,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('ONBOARD-NEG-05: Oversized document versions (>50 chars) are rejected', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUsers[0]);
       try {
         const longVersion = 'v'.repeat(51);
@@ -1470,7 +1445,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('ONBOARD-NEG-06 to NEG-08: Direct authenticated INSERT, UPDATE, DELETE on user_consents is rejected', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUsers[0]);
       try {
         // Direct INSERT blocked
@@ -1497,7 +1472,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('ONBOARD-NEG-09 & NEG-10: Client cannot directly mutate public.users.onboarded_at', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUsers[0]);
       try {
         await expect(
@@ -1513,7 +1488,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('ONBOARD-POS-01 to POS-07: Authenticated user can complete onboarding; generates atomic consent and audit record', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUsers[0]);
       try {
         const startTime = new Date(Date.now() - 5000);
@@ -1579,7 +1554,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('ONBOARD-NEG-11 & NEG-12: Calling onboarding a second time explicitly fails and leaves consent unchanged', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUsers[0]);
       try {
         const consentBefore = await adminClient.query(`SELECT accepted_at FROM public.user_consents WHERE user_id = $1;`, [testUsers[0].id]);
@@ -1603,7 +1578,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('ONBOARD-POS-08: Concurrency control via FOR UPDATE exclusively locks user row', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(testUsers[1]);
       const clientB = await createAuthClient(testUsers[1]);
 
@@ -1630,7 +1605,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('ONBOARD-NEG-13: Failed onboarding transaction leaves no partial user, consent, or audit state', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(testUsers[2]);
       try {
         // Capture pre-attempt state
@@ -1669,7 +1644,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('ONBOARD-NEG-14: Consent immutability trigger blocks UPDATE and DELETE on user_consents', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       // Even direct adminClient (privileged role) is blocked by the immutability trigger
       await expect(
         adminClient.query(`UPDATE public.user_consents SET tos_version = 'tampered' WHERE user_id = $1;`, [testUsers[0].id])
@@ -1691,20 +1666,21 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     const statusUserA: TestUser = {
       id: statusUserAId,
       name: 'Status User A',
-      phone: '+12025550301',
+      phone: uniqueTestPhone(),
       token: generateSupabaseJwt(statusUserAId),
     };
     const statusUserB: TestUser = {
       id: statusUserBId,
       name: 'Status User B',
-      phone: '+12025550302',
+      phone: uniqueTestPhone(),
       token: generateSupabaseJwt(statusUserBId),
     };
 
     beforeAll(async () => {
-      if (!isDbConnected) return;
+      if (!isDbConnected) throw new Error('Database integration setup ran without a verified local connection.');
 
       // Provision simulated fresh users who just completed phone OTP
+      additionalUserIds.push(statusUserA.id, statusUserB.id);
       await adminClient.query(
         `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
          VALUES ($1, $2, $3, '{}'::jsonb);`,
@@ -1719,7 +1695,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('STATUS-NEG-01: Anonymous / unauthenticated caller cannot execute get_my_onboarding_status()', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const anonClient = new Client({ connectionString: DB_URL });
       await anonClient.connect();
       try {
@@ -1733,7 +1709,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('STATUS-POS-01: Authenticated User A with onboarded_at NULL receives is_onboarded: false and onboarded_at: null', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(statusUserA);
       try {
         const res = await client.query(`SELECT public.get_my_onboarding_status() as status;`);
@@ -1748,7 +1724,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('STATUS-POS-02: After User A completes legitimate onboarding, get_my_onboarding_status() returns is_onboarded: true and valid timestamp', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(statusUserA);
       try {
         // Complete onboarding via legitimate RPC
@@ -1770,7 +1746,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('STATUS-NEG-02: Function has zero parameters (verified via PostgreSQL metadata)', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const paramCheck = await adminClient.query(`
         SELECT parameter_name, data_type
         FROM information_schema.parameters
@@ -1782,7 +1758,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('STATUS-NEG-03: User A cannot use any parameter or mechanism to request User B state', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const clientA = await createAuthClient(statusUserA);
       const clientB = await createAuthClient(statusUserB);
       try {
@@ -1805,7 +1781,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('STATUS-NEG-04: Returned JSON keys are EXACTLY is_onboarded and onboarded_at (no private PII exposed)', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(statusUserA);
       try {
         const res = await client.query(`SELECT public.get_my_onboarding_status() as status;`);
@@ -1829,7 +1805,7 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('STATUS-NEG-05: Calling RPC does not mutate public.users or create audit records', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const client = await createAuthClient(statusUserA);
       try {
         // Capture pre-invocation state
@@ -1866,12 +1842,13 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
     });
 
     test('STATUS-NEG-06: Missing public.users row fails closed with explicit error, never returning is_onboarded=false', async () => {
-      if (!isDbConnected) { expect(true).toBe(true); return; }
+      if (!isDbConnected) throw new Error('Database integration test ran without a verified local connection.');
       const orphanUserId = randomUUID();
+      additionalUserIds.push(orphanUserId);
       const orphanUser: TestUser = {
         id: orphanUserId,
         name: 'Orphan User',
-        phone: '+12025550309',
+        phone: uniqueTestPhone(),
         token: generateSupabaseJwt(orphanUserId),
       };
 

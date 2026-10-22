@@ -13,18 +13,20 @@
  * Verifies:
  * - Compatible with authoritative auth trigger handle_new_auth_user() (no duplicate inserts).
  * - Complete administrative fixture isolation with fresh generated UUIDs (never reusing existing data).
- * - Comprehensive reverse-dependency cleanup auditing EVERY modified table:
+ * - Reverse-dependency cleanup scoped to this run's generated identifiers:
  *   - messages verified independently of parent conversation existence
  *   - conversations tracked directly by captured ID
- *   - audit_logs, contact_shares, service_requests, provider profiles/locations, user accounts,
+ *   - contact_shares, service_requests, provider profiles/locations, roles/private data,
  *     services, categories, and full 4-level location hierarchy
- *   - fails if any test-owned rows remain across any table.
+ *   - immutable audit rows and their actor identities are retained and verified because
+ *     the audit ledger forbids deletion and its actor foreign key pins those identities.
  */
 
 import { Client } from 'pg';
 import { randomUUID } from 'crypto';
+import { resolveLocalDatabaseTestUrl } from './database-test-guard';
 
-const DB_URL = process.env.DATABASE_URL || 'postgresql://postgres:postgres@127.0.0.1:54322/postgres';
+const DB_URL = resolveLocalDatabaseTestUrl();
 
 // Helper to create an authenticated client session simulating PostgREST RLS
 async function createAuthClient(userId: string): Promise<Client> {
@@ -48,6 +50,8 @@ async function runConcurrencyRaceTest() {
   // Freshly generated distinct UUIDs for customer, provider, and requests
   const customerId = randomUUID();
   const providerUserId = randomUUID();
+  const customerEmail = `race-cust-${customerId}@example.com`;
+  const providerEmail = `race-prov-${providerUserId}@example.com`;
   const providerProfileId = randomUUID();
   const requestId = randomUUID();
   const requestId2 = randomUUID();
@@ -72,6 +76,36 @@ async function runConcurrencyRaceTest() {
   try {
     await adminClient.connect();
     console.log('[Setup] Connected administrative database client.');
+
+    // Fail before making changes if any generated fixture key already exists.
+    // Phone numbers are intentionally NULL: this race test does not exercise phone
+    // handling, and fixed E.164 values collided with immutable fixtures from prior runs.
+    const fixtureIds = [
+      customerId, providerUserId, providerProfileId, requestId, requestId2,
+      createdCountryId, createdStateId, createdCityId, createdAreaId,
+      createdCategoryId, createdServiceId,
+    ];
+    const idCollisions = await adminClient.query(
+      `SELECT table_name, id FROM (
+         SELECT 'auth.users'::text AS table_name, id FROM auth.users WHERE id = ANY($1::uuid[])
+         UNION ALL SELECT 'public.users', id FROM public.users WHERE id = ANY($1::uuid[])
+         UNION ALL SELECT 'service_requests', id FROM public.service_requests WHERE id = ANY($1::uuid[])
+         UNION ALL SELECT 'provider_profiles', id FROM public.provider_profiles WHERE id = ANY($1::uuid[])
+         UNION ALL SELECT 'locations', id FROM public.locations WHERE id = ANY($1::uuid[])
+         UNION ALL SELECT 'categories', id FROM public.categories WHERE id = ANY($1::uuid[])
+         UNION ALL SELECT 'services', id FROM public.services WHERE id = ANY($1::uuid[])
+       ) existing;`,
+      [fixtureIds]
+    );
+    const emailCollisions = await adminClient.query(
+      `SELECT id, email FROM auth.users WHERE email = ANY($1::text[]);`,
+      [[customerEmail, providerEmail]]
+    );
+    if (idCollisions.rowCount || emailCollisions.rowCount) {
+      throw new Error(
+        `Fixture collision before setup: ids=${JSON.stringify(idCollisions.rows)}, emails=${JSON.stringify(emailCollisions.rows)}`
+      );
+    }
 
     // 1. Provision dedicated, isolated 4-level location hierarchy
     console.log(`[Setup] Provisioning isolated location hierarchy (Area: ${createdAreaId})...`);
@@ -116,20 +150,20 @@ async function runConcurrencyRaceTest() {
     );
     console.log(`[Setup] Created catalog fixtures: Service ${createdServiceId} in Category ${createdCategoryId}`);
 
-    // 3. Create fresh Auth Users with authoritative metadata and phone.
-    // The on_auth_user_created trigger invokes handle_new_auth_user(), which authoritatively
-    // populates public.users, public.user_roles ('user'), and public.user_private (with phone_e164).
+    // 3. Create fresh Auth Users with per-run unique email identifiers and no phone.
+    // This test does not use phone data. The auth trigger creates public identity rows;
+    // audit events later pin those actor rows through the immutable audit ledger.
     console.log(`[Setup] Administrative provisioning of Customer (${customerId}) & Provider (${providerUserId})...`);
     await adminClient.query(
       `INSERT INTO auth.users (id, email, phone, raw_user_meta_data)
        VALUES
-         ($1, $2, '+12025550191', '{"full_name": "Race Customer"}'::jsonb),
-         ($3, $4, '+12025550192', '{"full_name": "Race Provider"}'::jsonb);`,
+         ($1, $2, NULL, '{"full_name": "Race Customer"}'::jsonb),
+         ($3, $4, NULL, '{"full_name": "Race Provider"}'::jsonb);`,
       [
         customerId,
-        `race_cust_${customerId.slice(0, 8)}@example.com`,
+        customerEmail,
         providerUserId,
-        `race_prov_${providerUserId.slice(0, 8)}@example.com`,
+        providerEmail,
       ]
     );
 
@@ -364,15 +398,9 @@ async function runConcurrencyRaceTest() {
     const reqIds = [requestId, requestId2];
     const convIds = [conversationId, conversationId2].filter((id): id is string => id !== null);
 
-    // 1. Clean up audit logs created by test operations (scoped strictly to test actors & test request/share entities)
-    await executeCleanupStep(
-      'Delete audit_logs',
-      `DELETE FROM public.audit_logs
-       WHERE actor_id IN ($1, $2)
-          OR (entity_type = 'service_requests' AND entity_id = ANY($3::uuid[]))
-          OR (entity_type = 'contact_shares' AND entity_id = ANY($4::uuid[]));`,
-      [customerId, providerUserId, reqIds, observedShareIds]
-    );
+    // Audit rows are intentionally immutable. Their actor_id foreign key uses
+    // ON DELETE SET NULL, so deleting an actor would attempt a forbidden audit
+    // row update. Keep only the run's audit-pinned identities; never mutate logs.
 
     // 2. Delete contact_shares
     await executeCleanupStep(
@@ -415,8 +443,24 @@ async function runConcurrencyRaceTest() {
     await executeCleanupStep('Delete provider_profiles', `DELETE FROM public.provider_profiles WHERE id = $1;`, [providerProfileId]);
     await executeCleanupStep('Delete user_roles', `DELETE FROM public.user_roles WHERE user_id IN ($1, $2);`, [customerId, providerUserId]);
     await executeCleanupStep('Delete user_private', `DELETE FROM public.user_private WHERE user_id IN ($1, $2);`, [customerId, providerUserId]);
-    await executeCleanupStep('Delete public.users', `DELETE FROM public.users WHERE id IN ($1, $2);`, [customerId, providerUserId]);
-    await executeCleanupStep('Delete auth.users', `DELETE FROM auth.users WHERE id IN ($1, $2);`, [customerId, providerUserId]);
+    let pinnedActorIds: string[] = [];
+    try {
+      const actorRefs = await adminClient.query(
+        `SELECT DISTINCT actor_id FROM public.audit_logs WHERE actor_id IN ($1, $2);`,
+        [customerId, providerUserId]
+      );
+      pinnedActorIds = actorRefs.rows.map((row) => row.actor_id);
+      if (pinnedActorIds.length > 0) {
+        console.log(
+          `[Cleanup] Preserving ${pinnedActorIds.length} run-owned auth/public user row(s) referenced by immutable audit logs.`
+        );
+      } else {
+        await executeCleanupStep('Delete public.users', `DELETE FROM public.users WHERE id IN ($1, $2);`, [customerId, providerUserId]);
+        await executeCleanupStep('Delete auth.users', `DELETE FROM auth.users WHERE id IN ($1, $2);`, [customerId, providerUserId]);
+      }
+    } catch (err: any) {
+      cleanupFailures.push(`[Check immutable audit actor references] ${err.message}`);
+    }
 
     // 6. Reverse-dependency deletion of catalog fixtures: service before category
     await executeCleanupStep('Delete created service', `DELETE FROM public.services WHERE id = $1;`, [createdServiceId]);
@@ -479,7 +523,7 @@ async function runConcurrencyRaceTest() {
         lingering.push(`${shareCount.rows[0].cnt} contact_shares`);
       }
 
-      // Verify audit_logs
+      // Verify audit_logs. Rows from this run are expected to remain immutable.
       const auditCount = await adminClient.query(
         `SELECT count(*)::int AS cnt FROM public.audit_logs
          WHERE actor_id IN ($1, $2)
@@ -487,9 +531,7 @@ async function runConcurrencyRaceTest() {
             OR (entity_type = 'contact_shares' AND entity_id = ANY($4::uuid[]));`,
         [customerId, providerUserId, reqIds, observedShareIds]
       );
-      if (auditCount.rows[0].cnt > 0) {
-        lingering.push(`${auditCount.rows[0].cnt} audit_logs`);
-      }
+      console.log(`[Cleanup] Preserved ${auditCount.rows[0].cnt} immutable audit log row(s) created by this run.`);
 
       // Verify service_requests
       const reqCount = await adminClient.query(
@@ -538,16 +580,16 @@ async function runConcurrencyRaceTest() {
         `SELECT count(*)::int AS cnt FROM public.users WHERE id IN ($1, $2);`,
         [customerId, providerUserId]
       );
-      if (pubUserCount.rows[0].cnt > 0) {
-        lingering.push(`${pubUserCount.rows[0].cnt} public.users`);
-      }
-
       const authUserCount = await adminClient.query(
         `SELECT count(*)::int AS cnt FROM auth.users WHERE id IN ($1, $2);`,
         [customerId, providerUserId]
       );
-      if (authUserCount.rows[0].cnt > 0) {
-        lingering.push(`${authUserCount.rows[0].cnt} auth.users`);
+      const expectedPinnedCount = new Set(pinnedActorIds).size;
+      if (pubUserCount.rows[0].cnt !== expectedPinnedCount) {
+        lingering.push(`unexpected public.users count ${pubUserCount.rows[0].cnt} (expected ${expectedPinnedCount} audit-pinned actors)`);
+      }
+      if (authUserCount.rows[0].cnt !== expectedPinnedCount) {
+        lingering.push(`unexpected auth.users count ${authUserCount.rows[0].cnt} (expected ${expectedPinnedCount} audit-pinned actors)`);
       }
 
       // Verify catalog fixtures
@@ -580,7 +622,7 @@ async function runConcurrencyRaceTest() {
       if (lingering.length > 0) {
         cleanupFailures.push(`Lingering fixtures detected after cleanup: ${lingering.join(', ')}`);
       } else {
-        console.log('[Cleanup] Verification confirmed: Exactly 0 test fixtures remain across all tables (including audit_logs, messages, conversations, locations, and catalog).');
+        console.log('[Cleanup] Verification confirmed: Mutable run fixtures are gone; only this run\'s immutable audit rows and referenced actor identities remain.');
       }
     } catch (verifErr: any) {
       cleanupFailures.push(`[Verification Query Error] ${verifErr.message}`);

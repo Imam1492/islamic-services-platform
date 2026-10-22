@@ -7,47 +7,54 @@ import { NextResponse, type NextRequest } from 'next/server';
  * on the server, avoiding untrusted local session claims.
  */
 export async function updateSession(request: NextRequest): Promise<NextResponse> {
-  let supabaseResponse = NextResponse.next({
-    request,
-  });
+  const isProtectedPath =
+    request.nextUrl.pathname === '/dashboard' ||
+    request.nextUrl.pathname.startsWith('/dashboard/');
+  const supabaseResponse = NextResponse.next({ request });
 
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
   const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 
   if (!supabaseUrl || !supabaseAnonKey) {
+    if (isProtectedPath) {
+      return new NextResponse('Admin authentication is unavailable.', { status: 503 });
+    }
     return supabaseResponse;
   }
 
-  const supabase = createServerClient(supabaseUrl, supabaseAnonKey, {
-    cookies: {
-      getAll() {
-        return request.cookies.getAll();
+  if (!isProtectedPath) return supabaseResponse;
+
+  let responseWithCookies = supabaseResponse;
+  try {
+    const supabase = createServerClient(supabaseUrl, supabaseAnonKey, {
+      cookies: {
+        getAll() {
+          return request.cookies.getAll();
+        },
+        setAll(cookiesToSet) {
+          cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
+          responseWithCookies = NextResponse.next({ request });
+          cookiesToSet.forEach(({ name, value, options }) =>
+            responseWithCookies.cookies.set(name, value, options)
+          );
+        },
       },
-      setAll(cookiesToSet) {
-        cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
-        supabaseResponse = NextResponse.next({
-          request,
-        });
-        cookiesToSet.forEach(({ name, value, options }) =>
-          supabaseResponse.cookies.set(name, value, options)
-        );
-      },
-    },
-  });
+    });
 
-  // Authoritative server-side user verification
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+    // Early authentication gate only. Role authorization is repeated by the
+    // dashboard server component and must also guard future server operations.
+    const { data, error } = await supabase.auth.getUser();
 
-  const isProtectedPath = request.nextUrl.pathname.startsWith('/dashboard');
+    if (error || !data?.user) {
+      const loginUrl = new URL('/login', request.url);
+      loginUrl.searchParams.set('redirectTo', request.nextUrl.pathname);
+      return NextResponse.redirect(loginUrl);
+    }
 
-  if (isProtectedPath && !user) {
-    const url = request.nextUrl.clone();
-    url.pathname = '/login';
-    url.searchParams.set('redirectTo', request.nextUrl.pathname);
-    return NextResponse.redirect(url);
+    return responseWithCookies;
+  } catch {
+    // Authentication service/configuration failures must never pass a
+    // protected request through.
+    return new NextResponse('Admin authentication is unavailable.', { status: 503 });
   }
-
-  return supabaseResponse;
 }

@@ -46,8 +46,10 @@ describe('Phase 2.6 - Integration Test Suite & CI Hardening Specification', () =
     });
 
     test('enforces hard failure in CI environment when database is unavailable (SEC-26-01)', () => {
-      expect(testContent).toContain("process.env.CI === 'true'");
-      expect(testContent).toContain('Database connection required in CI environment; security tests cannot run.');
+      const guardContent = fs.readFileSync(path.join(rootDir, 'supabase/tests/database-test-guard.ts'), 'utf8');
+      expect(testContent).toContain('shouldRunDatabaseIntegrationTests()');
+      expect(testContent).toContain('runDatabaseTests ? describe : describe.skip');
+      expect(guardContent).toContain("environment.CI === 'true'");
     });
   });
 

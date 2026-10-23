@@ -14,6 +14,8 @@ import { Client } from 'pg';
 import * as jwtLib from 'jsonwebtoken';
 const jwt: typeof import('jsonwebtoken') = (jwtLib as any).default ?? jwtLib;
 import { randomUUID } from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 
 // Types & Config
 interface TestUser {
@@ -1298,12 +1300,20 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
         }
 
         const policyCheck = await adminClient.query(`
-          SELECT tablename, policyname
+          SELECT tablename, policyname, roles
           FROM pg_policies
           WHERE schemaname = 'public'
             AND tablename IN ('user_roles', 'admin_area_assignments', 'provider_locations');
         `);
-        expect(policyCheck.rows.length).toBe(0);
+        // admin_area_assignments and provider_locations have 0 policies;
+        // user_roles has only the dedicated owner-scoped policy from Migration 12
+        const nonUserRolesPolicies = policyCheck.rows.filter((r: any) => r.tablename !== 'user_roles');
+        expect(nonUserRolesPolicies.length).toBe(0);
+        const userRolesPolicies = policyCheck.rows.filter((r: any) => r.tablename === 'user_roles');
+        expect(userRolesPolicies.length).toBeLessThanOrEqual(1);
+        if (userRolesPolicies.length === 1) {
+          expect(userRolesPolicies[0].policyname).toBe('p_user_roles_select_own_super_admin');
+        }
 
         // Direct authenticated SELECTs return 0 rows under default-deny
         const rolesCheck = await clientOrdinary.query(`SELECT * FROM public.user_roles;`);
@@ -1913,6 +1923,201 @@ describe('Step 2.6: Supabase / PostgreSQL Database Security Integration Test Sui
         expect(auditCheck.rows.length).toBe(0);
       } finally {
         await orphanClient.end();
+      }
+    });
+  });
+
+  // ==========================================================================
+  // 7. MIGRATION 12: SUPER ADMIN AUTHORIZATION & ROLE MEMBERSHIP TESTS
+  // ==========================================================================
+
+  describe('Migration 12: Super Admin Authorization & Role Membership Hardening', () => {
+    const migration12Path = path.resolve(
+      __dirname,
+      '../migrations/20261022000000_12_super_admin_authorization.sql'
+    );
+    const rollback12Path = path.resolve(
+      __dirname,
+      '../rollback/20261022000000_12_super_admin_authorization_down.sql'
+    );
+
+    test('M12-STATIC-01: Migration 12 and Rollback 12 files exist and are non-empty', () => {
+      expect(fs.existsSync(migration12Path)).toBe(true);
+      expect(fs.existsSync(rollback12Path)).toBe(true);
+      const migrationSql = fs.readFileSync(migration12Path, 'utf8');
+      const rollbackSql = fs.readFileSync(rollback12Path, 'utf8');
+      expect(migrationSql.length).toBeGreaterThan(500);
+      expect(rollbackSql.length).toBeGreaterThan(200);
+    });
+
+    test('M12-STATIC-02: Migration 12 provisions NOLOGIN least-privilege owner role and version-aware SET/INHERIT grant + cleanup', () => {
+      const migrationSql = fs.readFileSync(migration12Path, 'utf8');
+
+      // Dedicated least-privilege role attributes
+      expect(migrationSql).toContain('CREATE ROLE admin_super_admin_lookup_owner');
+      expect(migrationSql).toContain('NOLOGIN');
+      expect(migrationSql).toContain('NOSUPERUSER');
+      expect(migrationSql).toContain('NOCREATEDB');
+      expect(migrationSql).toContain('NOCREATEROLE');
+      expect(migrationSql).toContain('NOINHERIT');
+      expect(migrationSql).toContain('NOREPLICATION');
+      expect(migrationSql).toContain('NOBYPASSRLS');
+
+      // Hardened function definition
+      expect(migrationSql).toContain('CREATE OR REPLACE FUNCTION public.current_user_is_super_admin()');
+      expect(migrationSql).toContain('SECURITY DEFINER');
+      expect(migrationSql).toContain('SET search_path = pg_catalog, public, pg_temp');
+      expect(migrationSql).toContain('SET row_security = on');
+      expect(migrationSql).toContain('auth.uid()');
+
+      // Restricted RLS policy on user_roles
+      expect(migrationSql).toContain('CREATE POLICY p_user_roles_select_own_super_admin');
+      expect(migrationSql).toContain('ON public.user_roles');
+      expect(migrationSql).toContain('TO admin_super_admin_lookup_owner');
+      expect(migrationSql).toContain("role = 'super_admin'::public.app_role");
+
+      // Version-aware temporary membership grant before ALTER FUNCTION ... OWNER TO
+      expect(migrationSql).toContain("current_setting('server_version_num')::int >= 160000");
+      expect(migrationSql).toContain(
+        "GRANT admin_super_admin_lookup_owner TO %I WITH INHERIT TRUE, SET TRUE"
+      );
+      expect(migrationSql).toContain(
+        'ALTER FUNCTION public.current_user_is_super_admin() OWNER TO admin_super_admin_lookup_owner;'
+      );
+
+      // Function execution granted only to authenticated
+      expect(migrationSql).toContain(
+        'REVOKE ALL ON FUNCTION public.current_user_is_super_admin() FROM PUBLIC;'
+      );
+      expect(migrationSql).toContain(
+        'REVOKE ALL ON FUNCTION public.current_user_is_super_admin() FROM anon;'
+      );
+      expect(migrationSql).toContain(
+        'GRANT EXECUTE ON FUNCTION public.current_user_is_super_admin() TO authenticated;'
+      );
+
+      // Cleanup revokes temporary INHERIT and SET options on PG 16+
+      expect(migrationSql).toContain(
+        'REVOKE INHERIT OPTION FOR admin_super_admin_lookup_owner FROM %I'
+      );
+      expect(migrationSql).toContain(
+        'REVOKE SET OPTION FOR admin_super_admin_lookup_owner FROM %I'
+      );
+      expect(migrationSql).toContain(
+        'REVOKE CREATE ON SCHEMA public FROM admin_super_admin_lookup_owner;'
+      );
+
+      // No SUPERUSER, BYPASSRLS, or CASCADE
+      expect(migrationSql).not.toMatch(/\bSUPERUSER\b/i);
+      expect(migrationSql).not.toMatch(/\bBYPASSRLS\b/i);
+      expect(migrationSql).not.toMatch(/\bCASCADE\b/i);
+    });
+
+    test('M12-STATIC-03: Rollback 12 grants temporary membership before dropping function and avoids CASCADE', () => {
+      const rollbackSql = fs.readFileSync(rollback12Path, 'utf8');
+
+      expect(rollbackSql).toContain("current_setting('server_version_num')::int >= 160000");
+      expect(rollbackSql).toContain(
+        'GRANT admin_super_admin_lookup_owner TO %I WITH INHERIT TRUE, SET TRUE'
+      );
+      expect(rollbackSql).toContain('DROP FUNCTION IF EXISTS public.current_user_is_super_admin();');
+      expect(rollbackSql).toContain(
+        'DROP POLICY IF EXISTS p_user_roles_select_own_super_admin ON public.user_roles;'
+      );
+      expect(rollbackSql).toContain(
+        'REVOKE ALL ON TABLE public.user_roles FROM admin_super_admin_lookup_owner;'
+      );
+      expect(rollbackSql).toContain(
+        'REVOKE ALL ON SCHEMA public FROM admin_super_admin_lookup_owner;'
+      );
+      expect(rollbackSql).toContain('DROP ROLE IF EXISTS admin_super_admin_lookup_owner;');
+      expect(rollbackSql).not.toMatch(/\bCASCADE\b/i);
+    });
+
+    test('M12-LIVE-01: Dedicated owner role attributes and pg_auth_members options are hardened', async () => {
+      if (!isDbConnected) {
+        expect(true).toBe(true);
+        return;
+      }
+
+      const roleRes = await adminClient.query(`
+        SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolinherit, rolreplication, rolbypassrls
+        FROM pg_catalog.pg_roles
+        WHERE rolname = 'admin_super_admin_lookup_owner';
+      `);
+      expect(roleRes.rows.length).toBe(1);
+      expect(roleRes.rows[0]).toEqual({
+        rolcanlogin: false,
+        rolsuper: false,
+        rolcreatedb: false,
+        rolcreaterole: false,
+        rolinherit: false,
+        rolreplication: false,
+        rolbypassrls: false,
+      });
+
+      // Verify pg_auth_members: no member may retain inherit_option = true or set_option = true
+      const verRes = await adminClient.query(`SELECT current_setting('server_version_num')::int AS ver;`);
+      const serverVersionNum = verRes.rows[0].ver;
+
+      if (serverVersionNum >= 160000) {
+        const memRes = await adminClient.query(`
+          SELECT r.rolname AS member_name, m.admin_option, m.inherit_option, m.set_option
+          FROM pg_catalog.pg_auth_members m
+          JOIN pg_catalog.pg_roles r ON r.oid = m.member
+          WHERE m.roleid = 'admin_super_admin_lookup_owner'::regrole;
+        `);
+        for (const row of memRes.rows) {
+          expect(row.inherit_option).toBe(false);
+          expect(row.set_option).toBe(false);
+          expect(['postgres', 'supabase_admin']).toContain(row.member_name);
+        }
+      } else {
+        const memRes = await adminClient.query(`
+          SELECT m.member
+          FROM pg_catalog.pg_auth_members m
+          WHERE m.roleid = 'admin_super_admin_lookup_owner'::regrole;
+        `);
+        expect(memRes.rows.length).toBe(0);
+      }
+    });
+
+    test('M12-LIVE-02: current_user_is_super_admin() enforces strict caller-only super_admin check', async () => {
+      if (!isDbConnected) {
+        expect(true).toBe(true);
+        return;
+      }
+
+      const clientSuper = await createAuthClient(fixtures.superAdmin);
+      const clientArea = await createAuthClient(fixtures.areaAdmin);
+      const clientProv = await createAuthClient(fixtures.provider1);
+      const clientUser = await createAuthClient(fixtures.userA);
+      const anonClient = new Client({ connectionString: DB_URL });
+      await anonClient.connect();
+
+      try {
+        const superRes = await clientSuper.query(`SELECT public.current_user_is_super_admin() AS is_sa;`);
+        expect(superRes.rows[0].is_sa).toBe(true);
+
+        const areaRes = await clientArea.query(`SELECT public.current_user_is_super_admin() AS is_sa;`);
+        expect(areaRes.rows[0].is_sa).toBe(false);
+
+        const provRes = await clientProv.query(`SELECT public.current_user_is_super_admin() AS is_sa;`);
+        expect(provRes.rows[0].is_sa).toBe(false);
+
+        const userRes = await clientUser.query(`SELECT public.current_user_is_super_admin() AS is_sa;`);
+        expect(userRes.rows[0].is_sa).toBe(false);
+
+        await anonClient.query(`SET ROLE anon;`);
+        await expect(
+          anonClient.query(`SELECT public.current_user_is_super_admin();`)
+        ).rejects.toThrow(/permission denied/i);
+      } finally {
+        await clientSuper.end();
+        await clientArea.end();
+        await clientProv.end();
+        await clientUser.end();
+        await anonClient.end();
       }
     });
   });

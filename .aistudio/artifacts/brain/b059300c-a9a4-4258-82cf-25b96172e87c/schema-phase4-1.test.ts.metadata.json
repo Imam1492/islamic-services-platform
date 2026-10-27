@@ -1,0 +1,5 @@
+{
+  "summary":  "Offline Jest static contract test suite (admin/src/__tests__/schema-phase4-1.test.ts) verifying Migration 12 and Rollback 12 SQL files.",
+  "updatedAt":  "2026-10-23T16:29:00.309221689Z",
+  "userFacing":  true
+}

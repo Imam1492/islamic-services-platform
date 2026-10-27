@@ -1,0 +1,5 @@
+{
+  "summary":  "Unified diff patch containing only the 3 hunks modified in supabase/tests/database-security.test.ts (imports, PROV-ADM-01 pg_policies assertion, and Section 7 Migration 12 tests) against the 1,920-line AI Studio Migration 11 baseline.",
+  "updatedAt":  "2026-10-23T16:29:16.657578096Z",
+  "userFacing":  true
+}

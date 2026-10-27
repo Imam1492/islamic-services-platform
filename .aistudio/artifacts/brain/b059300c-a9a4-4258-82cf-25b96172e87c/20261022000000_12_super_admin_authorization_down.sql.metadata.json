@@ -1,0 +1,5 @@
+{
+  "summary":  "Rollback SQL file for Migration 12 that re-grants temporary role membership on PostgreSQL 16+ before dropping public.current_user_is_super_admin(), drops the restricted RLS policy on public.user_roles, revokes privileges, and drops admin_super_admin_lookup_owner without CASCADE.",
+  "updatedAt":  "2026-10-23T16:28:32.504313164Z",
+  "userFacing":  true
+}

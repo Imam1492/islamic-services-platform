@@ -1,0 +1,5 @@
+{
+  "summary":  "Migration 12 SQL file provisioning the dedicated NOLOGIN least-privilege role admin_super_admin_lookup_owner, restricted user_roles RLS policy, hardened zero-argument public.current_user_is_super_admin() SECURITY DEFINER function, and PostgreSQL 16+ version-aware temporary INHERIT/SET membership grant and cleanup.",
+  "updatedAt":  "2026-10-23T16:28:19.577274499Z",
+  "userFacing":  true
+}

@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test:db": "jest --config jest.config.cjs supabase/tests/database-security.test.ts supabase/tests/discovery-security.test.ts"
+    "test:db": "jest --config jest.config.cjs supabase/tests/database-security.test.ts supabase/tests/discovery-security.test.ts",
+    "test:m12:static": "jest --config jest.config.cjs --testMatch \"**/admin/src/__tests__/schema-phase4-1.test.ts\"",
+    "test:m12:integration": "jest --config jest.config.cjs supabase/tests/migration12-integration.test.ts --runInBand"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
